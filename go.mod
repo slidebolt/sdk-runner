@@ -4,10 +4,8 @@ go 1.25.7
 
 require (
 	github.com/nats-io/nats.go v1.49.0
-	github.com/slidebolt/sdk-types v0.0.0
+	github.com/slidebolt/sdk-types v0.0.1
 )
-
-replace github.com/slidebolt/sdk-types => ../sdk-types
 
 require (
 	github.com/klauspost/compress v1.18.2 // indirect
