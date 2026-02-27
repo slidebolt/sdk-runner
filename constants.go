@@ -21,6 +21,7 @@ const (
 	SubjectRegistration   = "slidebolt.registration"
 	SubjectDiscoveryProbe = "slidebolt.discovery.probe"
 	SubjectSearchDevices  = "slidebolt.search.devices"
+	SubjectSearchEntities = "slidebolt.search.entities"
 	SubjectSearchPlugins  = "slidebolt.search.plugins"
 	SubjectEntityEvents   = "slidebolt.entity.events"
 )

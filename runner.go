@@ -82,6 +82,7 @@ func (r *Runner) Run() error {
 	r.nc.Subscribe(r.rpcSubject, r.handleRPC)
 	r.nc.Subscribe(SubjectSearchPlugins, r.handlePluginSearch)
 	r.nc.Subscribe(SubjectSearchDevices, r.handleDeviceSearch)
+	r.nc.Subscribe(SubjectSearchEntities, r.handleEntitySearch)
 	r.nc.Subscribe(SubjectRegistration, r.handleRegistration)
 	r.nc.Subscribe(SubjectEntityEvents, r.handleEntityEvent)
 	r.nc.Subscribe(SubjectDiscoveryProbe, func(m *nats.Msg) {
@@ -501,14 +502,45 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 	json.Unmarshal(m.Data, &q)
 	var matches []types.Device
 	for _, d := range r.loadDevices() {
-		if ok, _ := filepath.Match(q.Pattern, d.ID); ok {
-			matches = append(matches, d)
+		if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
+			continue
+		}
+		if !matchesLabels(d.Labels, q.Labels) {
+			continue
+		}
+		matches = append(matches, d)
+	}
+	if len(matches) > 0 {
+		data, _ := json.Marshal(matches)
+		m.Respond(data)
+	}
+}
+
+func (r *Runner) handleEntitySearch(m *nats.Msg) {
+	var q types.SearchQuery
+	json.Unmarshal(m.Data, &q)
+	var matches []types.Entity
+	for _, d := range r.loadDevices() {
+		for _, e := range r.loadEntities(d.ID) {
+			if !matchesLabels(e.Labels, q.Labels) {
+				continue
+			}
+			matches = append(matches, e)
 		}
 	}
 	if len(matches) > 0 {
 		data, _ := json.Marshal(matches)
 		m.Respond(data)
 	}
+}
+
+func matchesLabels(have, want map[string]string) bool {
+	for k, v := range want {
+		if have[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runner) snapshotRegistry() map[string]types.Registration {
