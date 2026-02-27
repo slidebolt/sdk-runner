@@ -194,6 +194,17 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 			}
 			return 0
 		},
+		"OnEntityCommand": func(L *lua.LState) int {
+			pluginID, deviceID, entityID := entityRefFromLuaArg(L, 2)
+			action := strings.TrimSpace(L.CheckString(3))
+			handler := strings.TrimSpace(L.CheckString(4))
+			if pluginID == "" || deviceID == "" || entityID == "" || action == "" || handler == "" {
+				return 0
+			}
+			selector := fmt.Sprintf("%s.%s.%s.%s", pluginID, deviceID, entityID, action)
+			rt.commandSubs[selector] = handler
+			return 0
+		},
 		"GetState": func(L *lua.LState) int {
 			key := strings.TrimSpace(L.CheckString(2))
 			if key == "" {
@@ -562,6 +573,20 @@ func sendCommandArgs(L *lua.LState) (pluginID, deviceID, entityID string, payloa
 		return getString(obj, "PluginID"), getString(obj, "DeviceID"), getString(obj, "EntityID"), getMapAny(obj, "Payload")
 	}
 	return strings.TrimSpace(L.CheckString(2)), strings.TrimSpace(L.CheckString(3)), strings.TrimSpace(L.CheckString(4)), lValueToAny(L.CheckAny(5))
+}
+
+func entityRefFromLuaArg(L *lua.LState, idx int) (pluginID, deviceID, entityID string) {
+	v := L.Get(idx)
+	tbl, ok := v.(*lua.LTable)
+	if !ok {
+		return "", "", ""
+	}
+	raw := lValueToAny(tbl)
+	obj, _ := raw.(map[string]any)
+	if obj == nil {
+		return "", "", ""
+	}
+	return getString(obj, "PluginID"), getString(obj, "DeviceID"), getString(obj, "EntityID")
 }
 
 func emitEventArgs(L *lua.LState) (deviceID, entityID string, payload any, correlationID string) {
