@@ -22,6 +22,7 @@ type Plugin interface {
 	// Lifecycle
 	OnInitialize(config Config, state types.Storage) (types.Manifest, types.Storage)
 	OnReady()
+	OnShutdown()
 	OnHealthCheck() (string, error)
 	OnStorageUpdate(current types.Storage) (types.Storage, error)
 

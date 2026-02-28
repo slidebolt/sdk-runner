@@ -92,6 +92,7 @@ func (r *Runner) Run() error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+	r.plugin.OnShutdown()
 	_ = r.nc.Drain()
 	return nil
 }
