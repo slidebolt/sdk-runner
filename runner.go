@@ -168,6 +168,30 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			result = created
 		}
 
+	case "entities/update":
+		var ent types.Entity
+		json.Unmarshal(req.Params, &ent)
+		updated, err := r.plugin.OnEntityUpdate(ent)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.saveEntity(updated)
+			result = updated
+		}
+
+	case "entities/delete":
+		var params struct {
+			DeviceID string `json:"device_id"`
+			EntityID string `json:"entity_id"`
+		}
+		json.Unmarshal(req.Params, &params)
+		if err := r.plugin.OnEntityDelete(params.DeviceID, params.EntityID); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.deleteEntity(params.DeviceID, params.EntityID)
+			result = true
+		}
+
 	case "entities/list":
 		var params struct {
 			DeviceID string `json:"device_id"`
@@ -644,6 +668,10 @@ func (r *Runner) saveDevice(dev types.Device) {
 
 func (r *Runner) deleteDevice(id string) {
 	os.Remove(filepath.Join(r.dataDir, "devices", id+".json"))
+}
+
+func (r *Runner) deleteEntity(deviceID, entityID string) {
+	os.Remove(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"))
 }
 
 func (r *Runner) loadDevices() []types.Device {
