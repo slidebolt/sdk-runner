@@ -23,11 +23,7 @@ func ReconcileDevice(existing types.Device, discovered types.Device) types.Devic
 	result.SourceID = discovered.SourceID
 	result.SourceName = discovered.SourceName
 
-	// 2. Hardware owns configuration (wins)
-	// We assume plugins provide the complete config during discovery
-	result.Config = discovered.Config
-
-	// 3. User owns LocalName (existing always wins, discovered LocalName is ignored)
+	// 2. User owns LocalName (existing always wins, discovered LocalName is ignored)
 	// (result.LocalName is already set from existing)
 
 	// 4. Merge Labels (existing user labels win over discovered hardware labels)

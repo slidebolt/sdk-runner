@@ -78,7 +78,7 @@ func (r *Runner) Run() error {
 
 	initialState := r.loadState("default")
 	var updatedState types.Storage
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r}, initialState)
+	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r}, initialState)
 	r.rpcSubject = SubjectRPCPrefix + r.manifest.ID
 	r.saveStateSynced("default", updatedState)
 	r.plugin.OnReady()
@@ -138,8 +138,27 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 
 	case "devices/update":
-		var dev types.Device
-		json.Unmarshal(req.Params, &dev)
+		var incoming types.Device
+		json.Unmarshal(req.Params, &incoming)
+		// Merge with persisted data so source fields (source_id, source_name)
+		// and the user field (local_name) never overwrite each other.
+		dev := r.loadDeviceByID(incoming.ID)
+		if dev.ID == "" {
+			dev = incoming
+		} else {
+			if incoming.SourceID != "" {
+				dev.SourceID = incoming.SourceID
+			}
+			if incoming.SourceName != "" {
+				dev.SourceName = incoming.SourceName
+			}
+			if incoming.LocalName != "" {
+				dev.LocalName = incoming.LocalName
+			}
+			if len(incoming.Labels) > 0 {
+				dev.Labels = incoming.Labels
+			}
+		}
 		updated, err := r.plugin.OnDeviceUpdate(dev)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -188,8 +207,27 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 
 	case "entities/update":
-		var ent types.Entity
-		json.Unmarshal(req.Params, &ent)
+		var incoming types.Entity
+		json.Unmarshal(req.Params, &incoming)
+		// Merge with persisted data so source fields (domain, actions) and the
+		// user field (local_name) never overwrite each other.
+		ent := r.loadEntity(incoming.DeviceID, incoming.ID)
+		if ent.ID == "" {
+			ent = incoming
+		} else {
+			if incoming.LocalName != "" {
+				ent.LocalName = incoming.LocalName
+			}
+			if incoming.Domain != "" {
+				ent.Domain = incoming.Domain
+			}
+			if len(incoming.Actions) > 0 {
+				ent.Actions = incoming.Actions
+			}
+			if len(incoming.Labels) > 0 {
+				ent.Labels = incoming.Labels
+			}
+		}
 		updated, err := r.plugin.OnEntityUpdate(ent)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -702,6 +740,8 @@ func (r *Runner) deleteDevice(id string) {
 	path := filepath.Join(r.dataDir, "devices", id+".json")
 	_ = os.Remove(path)
 	r.clearHash(path)
+	// Remove the entity directory for this device so no orphan files remain.
+	_ = os.RemoveAll(filepath.Join(r.dataDir, "devices", id))
 }
 
 func (r *Runner) deleteEntity(deviceID, entityID string) {
@@ -725,7 +765,25 @@ func (r *Runner) loadDevices() []types.Device {
 	return items
 }
 
+func (r *Runner) loadDeviceByID(id string) types.Device {
+	path := filepath.Join(r.dataDir, "devices", id+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return types.Device{}
+	}
+	r.seedHash(path, data)
+	var dev types.Device
+	json.Unmarshal(data, &dev)
+	return dev
+}
+
 func (r *Runner) saveEntity(ent types.Entity) {
+	// Ensure a device file exists before writing the entity so that
+	// loadDevices() can always discover the owning device.
+	deviceFile := filepath.Join(r.dataDir, "devices", ent.DeviceID+".json")
+	if _, err := os.Stat(deviceFile); os.IsNotExist(err) {
+		r.saveDevice(types.Device{ID: ent.DeviceID})
+	}
 	r.withDeviceLock(ent.DeviceID, func() {
 		dir := filepath.Join(r.dataDir, "devices", ent.DeviceID, "entities")
 		_ = os.MkdirAll(dir, 0o755)
@@ -895,4 +953,38 @@ func (r *Runner) writeIfChanged(path string, data []byte) error {
 	}
 	r.setHash(path, newHash)
 	return nil
+}
+
+// --- RawStore implementation ---
+
+// ReadRawDevice reads protocol-specific raw data for a device.
+func (r *Runner) ReadRawDevice(deviceID string) (json.RawMessage, error) {
+	path := filepath.Join(r.dataDir, "raw", "devices", deviceID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// WriteRawDevice writes protocol-specific raw data for a device.
+func (r *Runner) WriteRawDevice(deviceID string, data json.RawMessage) error {
+	path := filepath.Join(r.dataDir, "raw", "devices", deviceID+".json")
+	return r.writeIfChanged(path, data)
+}
+
+// ReadRawEntity reads protocol-specific raw data for an entity.
+func (r *Runner) ReadRawEntity(deviceID, entityID string) (json.RawMessage, error) {
+	path := filepath.Join(r.dataDir, "raw", "devices", deviceID, "entities", entityID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// WriteRawEntity writes protocol-specific raw data for an entity.
+func (r *Runner) WriteRawEntity(deviceID, entityID string, data json.RawMessage) error {
+	path := filepath.Join(r.dataDir, "raw", "devices", deviceID, "entities", entityID+".json")
+	return r.writeIfChanged(path, data)
 }

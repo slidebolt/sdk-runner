@@ -1,11 +1,26 @@
 package runner
 
-import "github.com/slidebolt/sdk-types"
+import (
+	"encoding/json"
+
+	"github.com/slidebolt/sdk-types"
+)
+
+// RawStore provides plugin-private raw data storage.
+// Only the plugin that owns a device/entity may read or write its raw data.
+// Raw files live under {dataDir}/raw/ and are invisible to the canonical store.
+type RawStore interface {
+	ReadRawDevice(deviceID string) (json.RawMessage, error)
+	WriteRawDevice(deviceID string, data json.RawMessage) error
+	ReadRawEntity(deviceID, entityID string) (json.RawMessage, error)
+	WriteRawEntity(deviceID, entityID string, data json.RawMessage) error
+}
 
 // Config is passed to a plugin during OnInitialize.
 type Config struct {
 	DataDir   string
 	EventSink EventSink
+	RawStore  RawStore
 }
 
 // EventSink allows plugin code to emit device-originated events back into
