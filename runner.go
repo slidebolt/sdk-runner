@@ -1,11 +1,14 @@
 package runner
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,6 +35,12 @@ type Runner struct {
 
 	scriptsMu sync.Mutex
 	scripts   map[scriptKey]*scriptRuntime
+
+	lockMu      sync.Mutex
+	deviceLocks map[string]*sync.Mutex
+
+	hashMu    sync.RWMutex
+	fileHash  map[string]string
 }
 
 var idSeq uint64
@@ -47,6 +56,8 @@ func NewRunner(p Plugin) *Runner {
 		statuses: make(map[string]types.CommandStatus),
 		registry: make(map[string]types.Registration),
 		scripts:  make(map[scriptKey]*scriptRuntime),
+		deviceLocks: make(map[string]*sync.Mutex),
+		fileHash:    make(map[string]string),
 	}
 }
 
@@ -153,6 +164,13 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
+			// Persist discovered devices so first-time discovery is durable.
+			for _, dev := range list {
+				if strings.TrimSpace(dev.ID) == "" {
+					continue
+				}
+				r.saveDevice(dev)
+			}
 			result = list
 		}
 
@@ -203,6 +221,19 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
+			// Persist discovered entities so entity state survives restarts.
+			for _, ent := range list {
+				if strings.TrimSpace(ent.ID) == "" {
+					continue
+				}
+				if strings.TrimSpace(ent.DeviceID) == "" {
+					ent.DeviceID = params.DeviceID
+				}
+				if strings.TrimSpace(ent.DeviceID) == "" {
+					continue
+				}
+				r.saveEntity(ent)
+			}
 			result = list
 		}
 
@@ -599,7 +630,7 @@ func (r *Runner) callRPC(pluginID, method string, params any, timeout time.Durat
 		return types.Response{}, err
 	}
 	if resp.Error != nil {
-		return resp, fmt.Errorf(resp.Error.Message)
+		return resp, fmt.Errorf("%s", resp.Error.Message)
 	}
 	return resp, nil
 }
@@ -664,15 +695,21 @@ func (r *Runner) saveDevice(dev types.Device) {
 	os.MkdirAll(dir, 0o755)
 	type DiskDevice types.Device
 	data, _ := json.MarshalIndent(DiskDevice(dev), "", "  ")
-	os.WriteFile(filepath.Join(dir, dev.ID+".json"), data, 0o644)
+	_ = r.writeIfChanged(filepath.Join(dir, dev.ID+".json"), data)
 }
 
 func (r *Runner) deleteDevice(id string) {
-	os.Remove(filepath.Join(r.dataDir, "devices", id+".json"))
+	path := filepath.Join(r.dataDir, "devices", id+".json")
+	_ = os.Remove(path)
+	r.clearHash(path)
 }
 
 func (r *Runner) deleteEntity(deviceID, entityID string) {
-	os.Remove(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"))
+	r.withDeviceLock(deviceID, func() {
+		path := filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json")
+		_ = os.Remove(path)
+		r.clearHash(path)
+	})
 }
 
 func (r *Runner) loadDevices() []types.Device {
@@ -680,6 +717,7 @@ func (r *Runner) loadDevices() []types.Device {
 	items := make([]types.Device, 0, len(files))
 	for _, f := range files {
 		data, _ := os.ReadFile(f)
+		r.seedHash(f, data)
 		var dev types.Device
 		json.Unmarshal(data, &dev)
 		items = append(items, dev)
@@ -688,14 +726,20 @@ func (r *Runner) loadDevices() []types.Device {
 }
 
 func (r *Runner) saveEntity(ent types.Entity) {
-	dir := filepath.Join(r.dataDir, "devices", ent.DeviceID, "entities")
-	os.MkdirAll(dir, 0o755)
-	data, _ := json.MarshalIndent(ent, "", "  ")
-	os.WriteFile(filepath.Join(dir, ent.ID+".json"), data, 0o644)
+	r.withDeviceLock(ent.DeviceID, func() {
+		dir := filepath.Join(r.dataDir, "devices", ent.DeviceID, "entities")
+		_ = os.MkdirAll(dir, 0o755)
+		data, _ := json.MarshalIndent(ent, "", "  ")
+		_ = r.writeIfChanged(filepath.Join(dir, ent.ID+".json"), data)
+	})
 }
 
 func (r *Runner) loadEntity(deviceID, entityID string) types.Entity {
-	data, _ := os.ReadFile(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"))
+	var data []byte
+	r.withDeviceLock(deviceID, func() {
+		data, _ = os.ReadFile(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"))
+	})
+	r.seedHash(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"), data)
 	var ent types.Entity
 	json.Unmarshal(data, &ent)
 	return ent
@@ -722,14 +766,18 @@ func (r *Runner) resolveEntity(deviceID, entityID string) types.Entity {
 }
 
 func (r *Runner) loadEntities(deviceID string) []types.Entity {
-	files, _ := filepath.Glob(filepath.Join(r.dataDir, "devices", deviceID, "entities", "*.json"))
-	items := make([]types.Entity, 0, len(files))
-	for _, f := range files {
-		data, _ := os.ReadFile(f)
-		var ent types.Entity
-		json.Unmarshal(data, &ent)
-		items = append(items, ent)
-	}
+	items := make([]types.Entity, 0)
+	r.withDeviceLock(deviceID, func() {
+		files, _ := filepath.Glob(filepath.Join(r.dataDir, "devices", deviceID, "entities", "*.json"))
+		items = make([]types.Entity, 0, len(files))
+		for _, f := range files {
+			data, _ := os.ReadFile(f)
+			r.seedHash(f, data)
+			var ent types.Entity
+			json.Unmarshal(data, &ent)
+			items = append(items, ent)
+		}
+	})
 	return items
 }
 
@@ -742,8 +790,109 @@ func (r *Runner) loadState(id string) types.Storage {
 
 func (r *Runner) saveStateSynced(id string, store types.Storage) {
 	data, _ := json.MarshalIndent(store, "", "  ")
-	f, _ := os.Create(filepath.Join(r.dataDir, id+".json"))
-	defer f.Close()
-	f.Write(data)
-	f.Sync()
+	_ = r.writeIfChanged(filepath.Join(r.dataDir, id+".json"), data)
+}
+
+func (r *Runner) deviceLock(deviceID string) *sync.Mutex {
+	key := strings.TrimSpace(deviceID)
+	if key == "" {
+		key = "_global"
+	}
+	r.lockMu.Lock()
+	defer r.lockMu.Unlock()
+	if l, ok := r.deviceLocks[key]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	r.deviceLocks[key] = l
+	return l
+}
+
+func (r *Runner) withDeviceLock(deviceID string, fn func()) {
+	l := r.deviceLock(deviceID)
+	l.Lock()
+	defer l.Unlock()
+	fn()
+}
+
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func (r *Runner) getHash(path string) (string, bool) {
+	r.hashMu.RLock()
+	defer r.hashMu.RUnlock()
+	h, ok := r.fileHash[path]
+	return h, ok
+}
+
+func (r *Runner) setHash(path, hash string) {
+	r.hashMu.Lock()
+	r.fileHash[path] = hash
+	r.hashMu.Unlock()
+}
+
+func (r *Runner) clearHash(path string) {
+	r.hashMu.Lock()
+	delete(r.fileHash, path)
+	r.hashMu.Unlock()
+}
+
+func (r *Runner) seedHash(path string, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if _, ok := r.getHash(path); ok {
+		return
+	}
+	r.setHash(path, hashBytes(data))
+}
+
+func (r *Runner) writeIfChanged(path string, data []byte) error {
+	newHash := hashBytes(data)
+	if oldHash, ok := r.getHash(path); ok && oldHash == newHash {
+		return nil
+	}
+
+	if oldHash, ok := r.getHash(path); !ok || oldHash != newHash {
+		if existing, err := os.ReadFile(path); err == nil {
+			existingHash := hashBytes(existing)
+			r.setHash(path, existingHash)
+			if existingHash == newHash {
+				return nil
+			}
+		}
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	r.setHash(path, newHash)
+	return nil
 }
