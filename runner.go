@@ -629,8 +629,15 @@ func (r *Runner) handleEntitySearch(m *nats.Msg) {
 }
 
 func matchesLabels(have, want map[string]string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	if have == nil {
+		return false
+	}
 	for k, v := range want {
-		if have[k] != v {
+		val, ok := have[k]
+		if !ok || val != v {
 			return false
 		}
 	}
