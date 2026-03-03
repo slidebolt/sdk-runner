@@ -1,12 +1,17 @@
 package runner
 
-// Environment variable keys passed to every plugin process by the launcher.
+// Environment variable keys read by the runner.
+const (
+	EnvNATSURL    = "NATS_URL"
+	EnvPluginData = "PLUGIN_DATA_DIR"
+)
+
+// Environment variable keys set by the launcher for the gateway.
+// Not consumed by the runner itself.
 const (
 	EnvAPIPort      = "API_PORT"
 	EnvAPIHost      = "API_HOST"
-	EnvNATSURL      = "NATS_URL"
 	EnvPluginRPCSbj = "PLUGIN_RPC_SUBJECT"
-	EnvPluginData   = "PLUGIN_DATA_DIR"
 	EnvRuntimeFile  = "RUNTIME_FILE"
 )
 

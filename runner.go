@@ -52,16 +52,20 @@ func nextID(prefix string) string {
 	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), atomic.AddUint64(&idSeq, 1))
 }
 
-func NewRunner(p Plugin) *Runner {
+func NewRunner(p Plugin) (*Runner, error) {
+	dataDir, err := RequireEnv(EnvPluginData)
+	if err != nil {
+		return nil, err
+	}
 	return &Runner{
 		plugin:      p,
-		dataDir:     MustGetEnv(EnvPluginData),
+		dataDir:     dataDir,
 		statuses:    make(map[string]types.CommandStatus),
 		registry:    make(map[string]types.Registration),
 		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
-	}
+	}, nil
 }
 
 func (r *Runner) Run() error {
@@ -72,8 +76,10 @@ func (r *Runner) Run() error {
 		return r.runDiscoveryMode()
 	}
 
-	url := MustGetEnv(EnvNATSURL)
-	var err error
+	url, err := RequireEnv(EnvNATSURL)
+	if err != nil {
+		return err
+	}
 	for i := 0; i < 5; i++ {
 		r.nc, err = nats.Connect(url)
 		if err == nil {
@@ -112,11 +118,16 @@ func (r *Runner) Run() error {
 	}
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
-	regData, _ := json.Marshal(reg)
+	regData, err := json.Marshal(reg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal registration: %w", err)
+	}
 	r.registryMu.Lock()
 	r.registry[r.manifest.ID] = reg
 	r.registryMu.Unlock()
-	r.nc.Publish(SubjectRegistration, regData)
+	if err := r.nc.Publish(SubjectRegistration, regData); err != nil {
+		log.Printf("plugin-runner: failed to publish registration: %v", err)
+	}
 
 	r.nc.Subscribe(r.rpcSubject, r.handleRPC)
 	r.nc.Subscribe(SubjectSearchPlugins, r.handlePluginSearch)
@@ -164,7 +175,10 @@ func (r *Runner) runDiscoveryMode() error {
 
 func (r *Runner) handleRPC(m *nats.Msg) {
 	var req types.Request
-	json.Unmarshal(m.Data, &req)
+	if err := json.Unmarshal(m.Data, &req); err != nil {
+		r.sendResponse(m, nil, nil, &types.RPCError{Code: -32700, Message: "parse error: " + err.Error()})
+		return
+	}
 	var result any
 	var rpcErr *types.RPCError
 
@@ -180,9 +194,22 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 	case "initialize":
 		result = r.manifest
 
+	case "storage/update":
+		current := r.loadState("default")
+		updated, err := r.plugin.OnStorageUpdate(current)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.saveStateSynced("default", updated)
+			result = updated
+		}
+
 	case "devices/create":
 		var dev types.Device
-		json.Unmarshal(req.Params, &dev)
+		if err := json.Unmarshal(req.Params, &dev); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		created, err := r.plugin.OnDeviceCreate(dev)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -193,7 +220,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "devices/update":
 		var incoming types.Device
-		json.Unmarshal(req.Params, &incoming)
+		if err := json.Unmarshal(req.Params, &incoming); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		// Merge with persisted data so source fields (source_id, source_name)
 		// and the user field (local_name) never overwrite each other.
 		dev := r.loadDeviceByID(incoming.ID)
@@ -223,7 +253,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "devices/delete":
 		var id string
-		json.Unmarshal(req.Params, &id)
+		if err := json.Unmarshal(req.Params, &id); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		if err := r.plugin.OnDeviceDelete(id); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -249,7 +282,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "entities/create":
 		var ent types.Entity
-		json.Unmarshal(req.Params, &ent)
+		if err := json.Unmarshal(req.Params, &ent); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		ent.Data.SyncStatus = "in_sync"
 		ent.Data.UpdatedAt = time.Now().UTC()
 		created, err := r.plugin.OnEntityCreate(ent)
@@ -262,7 +298,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "entities/update":
 		var incoming types.Entity
-		json.Unmarshal(req.Params, &incoming)
+		if err := json.Unmarshal(req.Params, &incoming); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		// Merge with persisted data so source fields (domain, actions) and the
 		// user field (local_name) never overwrite each other.
 		ent := r.loadEntity(incoming.DeviceID, incoming.ID)
@@ -295,7 +334,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			DeviceID string `json:"device_id"`
 			EntityID string `json:"entity_id"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		if err := r.plugin.OnEntityDelete(params.DeviceID, params.EntityID); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -307,7 +349,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		var params struct {
 			DeviceID string `json:"device_id"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		current := r.loadEntities(params.DeviceID)
 		list, err := r.plugin.OnEntitiesList(params.DeviceID, current)
 		if err != nil {
@@ -335,7 +380,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			EntityID string          `json:"entity_id"`
 			Payload  json.RawMessage `json:"payload"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		status, err := r.createCommand(params.DeviceID, params.EntityID, params.Payload)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -347,7 +395,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		var params struct {
 			CommandID string `json:"command_id"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		status, ok := r.getCommandStatus(params.CommandID)
 		if !ok {
 			rpcErr = &types.RPCError{Code: -32002, Message: "command not found"}
@@ -357,7 +408,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "entities/events/ingest":
 		var evt types.InboundEventTyped[types.GenericPayload]
-		json.Unmarshal(req.Params, &evt)
+		if err := json.Unmarshal(req.Params, &evt); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		updated, err := r.processInboundEvent(evt)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -370,7 +424,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			DeviceID string `json:"device_id"`
 			EntityID string `json:"entity_id"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		source, path, err := r.getScriptSource(params.DeviceID, params.EntityID)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32004, Message: err.Error()}
@@ -390,7 +447,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			EntityID string `json:"entity_id"`
 			Source   string `json:"source"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		path, err := r.putScriptSource(params.DeviceID, params.EntityID, params.Source)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -410,7 +470,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			EntityID   string `json:"entity_id"`
 			PurgeState bool   `json:"purge_state"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		err := r.deleteScriptSource(params.DeviceID, params.EntityID, params.PurgeState)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -429,7 +492,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			DeviceID string `json:"device_id"`
 			EntityID string `json:"entity_id"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		state, path := r.getScriptState(params.DeviceID, params.EntityID)
 		result = map[string]any{
 			"plugin_id": r.manifest.ID,
@@ -445,7 +511,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			EntityID string         `json:"entity_id"`
 			State    map[string]any `json:"state"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		path, err := r.putScriptState(params.DeviceID, params.EntityID, params.State)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -464,7 +533,10 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			DeviceID string `json:"device_id"`
 			EntityID string `json:"entity_id"`
 		}
-		json.Unmarshal(req.Params, &params)
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
 		path, err := r.deleteScriptState(params.DeviceID, params.EntityID)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
@@ -598,7 +670,10 @@ func (r *Runner) processInboundEvent(evt types.InboundEventTyped[types.GenericPa
 	updated.Data.UpdatedAt = time.Now().UTC()
 	r.saveEntity(updated)
 
-	envelopePayload, _ := json.Marshal(event.Payload)
+	envelopePayload, err := json.Marshal(event.Payload)
+	if err != nil {
+		return types.Entity{}, fmt.Errorf("failed to marshal event payload: %w", err)
+	}
 	envelope := types.EntityEventEnvelope{
 		EventID:       event.ID,
 		PluginID:      event.PluginID,
@@ -609,8 +684,10 @@ func (r *Runner) processInboundEvent(evt types.InboundEventTyped[types.GenericPa
 		Payload:       envelopePayload,
 		CreatedAt:     event.CreatedAt,
 	}
-	if data, err := json.Marshal(envelope); err == nil {
-		r.nc.Publish(SubjectEntityEvents, data)
+	if data, err := json.Marshal(envelope); err != nil {
+		log.Printf("plugin-runner: failed to marshal event envelope: %v", err)
+	} else if err := r.nc.Publish(SubjectEntityEvents, data); err != nil {
+		log.Printf("plugin-runner: failed to publish entity event: %v", err)
 	}
 	go r.dispatchLuaEvent(envelope)
 
@@ -656,16 +733,26 @@ func (r *Runner) setCommandStatus(status types.CommandStatus) {
 
 func (r *Runner) handlePluginSearch(m *nats.Msg) {
 	var q types.SearchQuery
-	json.Unmarshal(m.Data, &q)
+	if err := json.Unmarshal(m.Data, &q); err != nil {
+		return
+	}
 	if match, _ := filepath.Match(q.Pattern, r.manifest.Name); match {
-		data, _ := json.Marshal(r.manifest)
-		m.Respond(data)
+		data, err := json.Marshal(r.manifest)
+		if err != nil {
+			log.Printf("plugin-runner: failed to marshal plugin search result: %v", err)
+			return
+		}
+		if err := m.Respond(data); err != nil {
+			log.Printf("plugin-runner: failed to respond to plugin search: %v", err)
+		}
 	}
 }
 
 func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 	var q types.SearchQuery
-	json.Unmarshal(m.Data, &q)
+	if err := json.Unmarshal(m.Data, &q); err != nil {
+		return
+	}
 	var matches []types.Device
 	for _, d := range r.loadDevices() {
 		if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
@@ -677,17 +764,30 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 		matches = append(matches, d)
 	}
 	if len(matches) > 0 {
-		data, _ := json.Marshal(matches)
-		m.Respond(data)
+		data, err := json.Marshal(matches)
+		if err != nil {
+			log.Printf("plugin-runner: failed to marshal device search results: %v", err)
+			return
+		}
+		if err := m.Respond(data); err != nil {
+			log.Printf("plugin-runner: failed to respond to device search: %v", err)
+		}
 	}
 }
 
 func (r *Runner) handleEntitySearch(m *nats.Msg) {
 	var q types.SearchQuery
-	json.Unmarshal(m.Data, &q)
+	if err := json.Unmarshal(m.Data, &q); err != nil {
+		return
+	}
 	var matches []types.Entity
 	for _, d := range r.loadDevices() {
 		for _, e := range r.loadEntities(d.ID) {
+			if q.Pattern != "" {
+				if ok, _ := filepath.Match(q.Pattern, e.ID); !ok {
+					continue
+				}
+			}
 			if !matchesLabels(e.Labels, q.Labels) {
 				continue
 			}
@@ -695,8 +795,14 @@ func (r *Runner) handleEntitySearch(m *nats.Msg) {
 		}
 	}
 	if len(matches) > 0 {
-		data, _ := json.Marshal(matches)
-		m.Respond(data)
+		data, err := json.Marshal(matches)
+		if err != nil {
+			log.Printf("plugin-runner: failed to marshal entity search results: %v", err)
+			return
+		}
+		if err := m.Respond(data); err != nil {
+			log.Printf("plugin-runner: failed to respond to entity search: %v", err)
+		}
 	}
 }
 
@@ -807,14 +913,26 @@ func (r *Runner) callCreateCommand(pluginID, deviceID, entityID string, payload 
 func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcErr *types.RPCError) {
 	var resBytes json.RawMessage
 	if result != nil {
-		resBytes, _ = json.Marshal(result)
+		var err error
+		resBytes, err = json.Marshal(result)
+		if err != nil {
+			log.Printf("plugin-runner: failed to marshal RPC result: %v", err)
+			rpcErr = &types.RPCError{Code: -32603, Message: "internal error: failed to marshal result"}
+			resBytes = nil
+		}
 	}
 	resp := types.Response{JSONRPC: types.JSONRPCVersion, Result: resBytes, Error: rpcErr}
 	if id != nil {
 		resp.ID = *id
 	}
-	data, _ := json.Marshal(resp)
-	m.Respond(data)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal RPC response: %v", err)
+		return
+	}
+	if err := m.Respond(data); err != nil {
+		log.Printf("plugin-runner: failed to send RPC response: %v", err)
+	}
 }
 
 // --- File persistence ---

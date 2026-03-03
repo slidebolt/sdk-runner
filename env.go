@@ -5,12 +5,11 @@ import (
 	"os"
 )
 
-// MustGetEnv returns the value of an environment variable or panics.
-// Used during plugin startup where a missing variable is a fatal misconfiguration.
-func MustGetEnv(key string) string {
+// RequireEnv returns the value of an environment variable or an error if unset.
+func RequireEnv(key string) (string, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		panic(fmt.Sprintf("FATAL: required environment variable %s is not set", key))
+		return "", fmt.Errorf("required environment variable %s is not set", key)
 	}
-	return v
+	return v, nil
 }

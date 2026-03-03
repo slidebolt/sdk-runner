@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -683,10 +684,15 @@ func (r *Runner) loadScriptState(deviceID, entityID string) map[string]any {
 }
 
 func (r *Runner) saveScriptState(deviceID, entityID string, state map[string]any) {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal script state: %v", err)
+		return
+	}
 	path := r.scriptStatePath(deviceID, entityID)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	data, _ := json.MarshalIndent(state, "", "  ")
-	_ = os.WriteFile(path, data, 0o644)
+	if err := r.writeIfChanged(path, data); err != nil {
+		log.Printf("plugin-runner: failed to write script state: %v", err)
+	}
 }
 
 func (r *Runner) invalidateScriptRuntime(deviceID, entityID string) {
