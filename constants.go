@@ -29,4 +29,5 @@ const (
 	SubjectSearchEntities = "slidebolt.search.entities"
 	SubjectSearchPlugins  = "slidebolt.search.plugins"
 	SubjectEntityEvents   = "slidebolt.entity.events"
+	SubjectCommandStatus  = "slidebolt.command.status"
 )

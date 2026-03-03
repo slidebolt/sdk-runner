@@ -53,3 +53,40 @@ func ReconcileDevices(existingMap map[string]types.Device, discovered []types.De
 	}
 	return out
 }
+
+// EnsureCoreDevice guarantees that the plugin's management device (ID = pluginID) is present
+// in the device list. Call this at the end of OnDevicesList.
+func EnsureCoreDevice(pluginID string, current []types.Device) []types.Device {
+	coreID := types.CoreDeviceID(pluginID)
+	for _, d := range current {
+		if d.ID == coreID {
+			return current
+		}
+	}
+	return append(current, ReconcileDevice(types.Device{}, types.Device{
+		ID:         coreID,
+		SourceID:   coreID,
+		SourceName: pluginID,
+	}))
+}
+
+// EnsureCoreEntities guarantees that the core health entity is present for the plugin's
+// management device. Call this at the start of OnEntitiesList for every deviceID.
+func EnsureCoreEntities(pluginID, deviceID string, current []types.Entity) []types.Entity {
+	if deviceID != types.CoreDeviceID(pluginID) {
+		return current
+	}
+	for _, need := range types.CoreEntities(pluginID) {
+		found := false
+		for _, e := range current {
+			if e.ID == need.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			current = append(current, need)
+		}
+	}
+	return current
+}

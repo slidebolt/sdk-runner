@@ -309,15 +309,12 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 				L.Push(lua.LString("missing DeviceID/EntityID"))
 				return 2
 			}
-			typedPayload := types.GenericPayload{}
-			if m, ok := payload.(map[string]any); ok {
-				typedPayload = types.GenericPayload(m)
-			}
-			err := r.EmitTypedEvent(types.InboundEventTyped[types.GenericPayload]{
+			rawPayload, _ := json.Marshal(payload)
+			err := r.EmitEvent(types.InboundEvent{
 				DeviceID:      deviceID,
 				EntityID:      entityID,
 				CorrelationID: correlationID,
-				Payload:       typedPayload,
+				Payload:       rawPayload,
 			})
 			if err != nil {
 				L.Push(lua.LNil)

@@ -407,7 +407,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 
 	case "entities/events/ingest":
-		var evt types.InboundEventTyped[types.GenericPayload]
+		var evt types.InboundEvent
 		if err := json.Unmarshal(req.Params, &evt); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
@@ -588,23 +588,8 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	ent.Data.LastCommandID = cmd.ID
 	ent.Data.SyncStatus = "pending"
 	ent.Data.UpdatedAt = now
-	typedPayload := types.GenericPayload{}
-	if len(payload) > 0 {
-		if err := json.Unmarshal(payload, &typedPayload); err != nil {
-			status.State = types.CommandFailed
-			status.Error = fmt.Sprintf("invalid command payload: %v", err)
-			status.LastUpdatedAt = time.Now().UTC()
-			r.setCommandStatus(status)
-			return types.CommandStatus{}, err
-		}
-	}
-	updated, err := r.plugin.OnCommandTyped(types.CommandRequest[types.GenericPayload]{
-		CommandID: cmd.ID,
-		PluginID:  cmd.PluginID,
-		Device:    r.loadDeviceByID(deviceID),
-		Entity:    ent,
-		Payload:   typedPayload,
-	}, ent)
+
+	updated, err := r.plugin.OnCommand(cmd, ent)
 	if err != nil {
 		status.State = types.CommandFailed
 		status.Error = err.Error()
@@ -626,9 +611,9 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	return status, nil
 }
 
-// EmitTypedEvent satisfies EventSink, letting plugin code publish provider-originated
+// EmitEvent satisfies EventSink, letting plugin code publish provider-originated
 // events back into the system after completing last-mile work.
-func (r *Runner) EmitTypedEvent(evt types.InboundEventTyped[types.GenericPayload]) error {
+func (r *Runner) EmitEvent(evt types.InboundEvent) error {
 	if r.nc == nil {
 		return nil // No-op in discovery mode
 	}
@@ -636,12 +621,12 @@ func (r *Runner) EmitTypedEvent(evt types.InboundEventTyped[types.GenericPayload
 	return err
 }
 
-func (r *Runner) processInboundEvent(evt types.InboundEventTyped[types.GenericPayload]) (types.Entity, error) {
+func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, error) {
 	ent := r.resolveEntity(evt.DeviceID, evt.EntityID)
 	if ent.ID == "" {
 		return types.Entity{}, fmt.Errorf("entity not found")
 	}
-	event := types.EventTyped[types.GenericPayload]{
+	event := types.Event{
 		ID:            nextID("evt"),
 		PluginID:      r.manifest.ID,
 		DeviceID:      evt.DeviceID,
@@ -651,7 +636,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEventTyped[types.GenericPa
 		Payload:       evt.Payload,
 		CreatedAt:     time.Now().UTC(),
 	}
-	updated, err := r.plugin.OnEventTyped(event, ent)
+	updated, err := r.plugin.OnEvent(event, ent)
 	if err != nil {
 		return types.Entity{}, err
 	}
@@ -702,6 +687,11 @@ func (r *Runner) handleRegistration(m *nats.Msg) {
 	if reg.Manifest.ID == "" || reg.RPCSubject == "" {
 		return
 	}
+
+	for _, schema := range reg.Manifest.Schemas {
+		types.RegisterDomain(schema)
+	}
+
 	r.registryMu.Lock()
 	r.registry[reg.Manifest.ID] = reg
 	r.registryMu.Unlock()
@@ -727,8 +717,13 @@ func (r *Runner) getCommandStatus(id string) (types.CommandStatus, bool) {
 
 func (r *Runner) setCommandStatus(status types.CommandStatus) {
 	r.statusMu.Lock()
-	defer r.statusMu.Unlock()
 	r.statuses[status.CommandID] = status
+	r.statusMu.Unlock()
+	if r.nc != nil {
+		if data, err := json.Marshal(status); err == nil {
+			r.nc.Publish(SubjectCommandStatus, data)
+		}
+	}
 }
 
 func (r *Runner) handlePluginSearch(m *nats.Msg) {

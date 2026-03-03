@@ -28,7 +28,7 @@ type Config struct {
 // the system after completing last-mile work (e.g. after an HTTP call to
 // a real device confirms a command was applied).
 type EventSink interface {
-	EmitTypedEvent(evt types.InboundEventTyped[types.GenericPayload]) error
+	EmitEvent(evt types.InboundEvent) error
 }
 
 // Plugin is the interface every plugin must implement.
@@ -57,6 +57,6 @@ type Plugin interface {
 	OnEntitiesList(deviceID string, current []types.Entity) ([]types.Entity, error)
 
 	// Commands and Events
-	OnCommandTyped(req types.CommandRequest[types.GenericPayload], entity types.Entity) (types.Entity, error)
-	OnEventTyped(evt types.EventTyped[types.GenericPayload], entity types.Entity) (types.Entity, error)
+	OnCommand(req types.Command, entity types.Entity) (types.Entity, error)
+	OnEvent(evt types.Event, entity types.Entity) (types.Entity, error)
 }
