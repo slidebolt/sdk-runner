@@ -12,7 +12,7 @@ func ReconcileDevice(existing types.Device, discovered types.Device) types.Devic
 	if existing.ID == "" {
 		discovered.LocalName = "" // Hardware cannot set LocalName
 		if discovered.Labels == nil {
-			discovered.Labels = make(map[string]string)
+			discovered.Labels = make(map[string][]string)
 		}
 		return discovered
 	}
@@ -28,7 +28,7 @@ func ReconcileDevice(existing types.Device, discovered types.Device) types.Devic
 
 	// 4. Merge Labels (existing user labels win over discovered hardware labels)
 	if result.Labels == nil {
-		result.Labels = make(map[string]string)
+		result.Labels = make(map[string][]string)
 	}
 	for k, v := range discovered.Labels {
 		if _, ok := result.Labels[k]; !ok {

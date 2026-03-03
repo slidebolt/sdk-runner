@@ -31,6 +31,7 @@ type scriptRuntime struct {
 	commandSubs map[string]string
 	state       map[string]any
 	mu          sync.Mutex
+	closed      bool
 }
 
 type scriptQuery struct {
@@ -59,7 +60,10 @@ func (r *Runner) ensureScriptRuntime(deviceID, entityID string) (*scriptRuntime,
 		return existing, nil
 	}
 	if existing, ok := r.scripts[key]; ok {
+		existing.mu.Lock()
 		existing.L.Close()
+		existing.closed = true
+		existing.mu.Unlock()
 		delete(r.scripts, key)
 	}
 
@@ -113,6 +117,9 @@ func (r *Runner) dispatchLuaCommand(cmd types.Command) {
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	if rt.closed {
+		return
+	}
 	for _, selector := range selectors {
 		handler, ok := rt.commandSubs[selector]
 		if !ok || handler == "" {
@@ -137,6 +144,10 @@ func (r *Runner) dispatchLuaEvent(env types.EntityEventEnvelope) {
 
 	for _, rt := range snapshot {
 		rt.mu.Lock()
+		if rt.closed {
+			rt.mu.Unlock()
+			continue
+		}
 		for _, selector := range selectors {
 			handler, ok := rt.eventSubs[selector]
 			if !ok || handler == "" {
@@ -297,12 +308,15 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 				L.Push(lua.LString("missing DeviceID/EntityID"))
 				return 2
 			}
-			body, _ := json.Marshal(payload)
-			err := r.EmitEvent(types.InboundEvent{
+			typedPayload := types.GenericPayload{}
+			if m, ok := payload.(map[string]any); ok {
+				typedPayload = types.GenericPayload(m)
+			}
+			err := r.EmitTypedEvent(types.InboundEventTyped[types.GenericPayload]{
 				DeviceID:      deviceID,
 				EntityID:      entityID,
 				CorrelationID: correlationID,
-				Payload:       body,
+				Payload:       typedPayload,
 			})
 			if err != nil {
 				L.Push(lua.LNil)
@@ -680,7 +694,10 @@ func (r *Runner) invalidateScriptRuntime(deviceID, entityID string) {
 	r.scriptsMu.Lock()
 	defer r.scriptsMu.Unlock()
 	if rt, ok := r.scripts[key]; ok {
+		rt.mu.Lock()
 		rt.L.Close()
+		rt.closed = true
+		rt.mu.Unlock()
 		delete(r.scripts, key)
 	}
 }

@@ -1,10 +1,13 @@
 package runner
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -39,8 +42,8 @@ type Runner struct {
 	lockMu      sync.Mutex
 	deviceLocks map[string]*sync.Mutex
 
-	hashMu    sync.RWMutex
-	fileHash  map[string]string
+	hashMu   sync.RWMutex
+	fileHash map[string]string
 }
 
 var idSeq uint64
@@ -51,17 +54,24 @@ func nextID(prefix string) string {
 
 func NewRunner(p Plugin) *Runner {
 	return &Runner{
-		plugin:   p,
-		dataDir:  MustGetEnv(EnvPluginData),
-		statuses: make(map[string]types.CommandStatus),
-		registry: make(map[string]types.Registration),
-		scripts:  make(map[scriptKey]*scriptRuntime),
+		plugin:      p,
+		dataDir:     MustGetEnv(EnvPluginData),
+		statuses:    make(map[string]types.CommandStatus),
+		registry:    make(map[string]types.Registration),
+		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 	}
 }
 
 func (r *Runner) Run() error {
+	discover := flag.Bool("discover", false, "Run discovery cycle and exit")
+	flag.Parse()
+
+	if *discover {
+		return r.runDiscoveryMode()
+	}
+
 	url := MustGetEnv(EnvNATSURL)
 	var err error
 	for i := 0; i < 5; i++ {
@@ -82,6 +92,24 @@ func (r *Runner) Run() error {
 	r.rpcSubject = SubjectRPCPrefix + r.manifest.ID
 	r.saveStateSynced("default", updatedState)
 	r.plugin.OnReady()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := r.plugin.WaitReady(waitCtx); err != nil {
+		log.Printf("plugin-runner: WaitReady failed: %v; proceeding with registration anyway", err)
+	}
+	waitCancel()
+
+	// Proactively initialize devices before accepting RPC traffic so that
+	// adapters and in-memory state are ready before the first command arrives.
+	if list, err := r.plugin.OnDevicesList(r.loadDevices()); err != nil {
+		log.Printf("plugin-runner: proactive OnDevicesList failed: %v", err)
+	} else {
+		for _, dev := range list {
+			if strings.TrimSpace(dev.ID) != "" {
+				r.saveDevice(dev)
+			}
+		}
+	}
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
 	regData, _ := json.Marshal(reg)
@@ -105,6 +133,32 @@ func (r *Runner) Run() error {
 	<-sigCh
 	r.plugin.OnShutdown()
 	_ = r.nc.Drain()
+	return nil
+}
+
+func (r *Runner) runDiscoveryMode() error {
+	_ = os.MkdirAll(r.dataDir, 0o755)
+	initialState := r.loadState("default")
+	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r}, initialState)
+	r.plugin.OnReady()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := r.plugin.WaitReady(waitCtx); err != nil {
+		log.Printf("plugin-runner: WaitReady failed in discovery mode: %v; proceeding anyway", err)
+	}
+	waitCancel()
+
+	devices, err := r.plugin.OnDevicesList(nil)
+	if err != nil {
+		return fmt.Errorf("discovery failed: %w", err)
+	}
+
+	output, err := json.MarshalIndent(devices, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal discovery results: %w", err)
+	}
+
+	fmt.Println(string(output))
 	return nil
 }
 
@@ -302,7 +356,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 
 	case "entities/events/ingest":
-		var evt types.InboundEvent
+		var evt types.InboundEventTyped[types.GenericPayload]
 		json.Unmarshal(req.Params, &evt)
 		updated, err := r.processInboundEvent(evt)
 		if err != nil {
@@ -462,7 +516,23 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	ent.Data.LastCommandID = cmd.ID
 	ent.Data.SyncStatus = "pending"
 	ent.Data.UpdatedAt = now
-	updated, err := r.plugin.OnCommand(cmd, ent)
+	typedPayload := types.GenericPayload{}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &typedPayload); err != nil {
+			status.State = types.CommandFailed
+			status.Error = fmt.Sprintf("invalid command payload: %v", err)
+			status.LastUpdatedAt = time.Now().UTC()
+			r.setCommandStatus(status)
+			return types.CommandStatus{}, err
+		}
+	}
+	updated, err := r.plugin.OnCommandTyped(types.CommandRequest[types.GenericPayload]{
+		CommandID: cmd.ID,
+		PluginID:  cmd.PluginID,
+		Device:    r.loadDeviceByID(deviceID),
+		Entity:    ent,
+		Payload:   typedPayload,
+	}, ent)
 	if err != nil {
 		status.State = types.CommandFailed
 		status.Error = err.Error()
@@ -484,20 +554,22 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	return status, nil
 }
 
-// EmitEvent satisfies EventSink, letting plugin code publish provider-originated
+// EmitTypedEvent satisfies EventSink, letting plugin code publish provider-originated
 // events back into the system after completing last-mile work.
-func (r *Runner) EmitEvent(evt types.InboundEvent) error {
+func (r *Runner) EmitTypedEvent(evt types.InboundEventTyped[types.GenericPayload]) error {
+	if r.nc == nil {
+		return nil // No-op in discovery mode
+	}
 	_, err := r.processInboundEvent(evt)
 	return err
 }
 
-func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, error) {
+func (r *Runner) processInboundEvent(evt types.InboundEventTyped[types.GenericPayload]) (types.Entity, error) {
 	ent := r.resolveEntity(evt.DeviceID, evt.EntityID)
 	if ent.ID == "" {
 		return types.Entity{}, fmt.Errorf("entity not found")
 	}
-
-	event := types.Event{
+	event := types.EventTyped[types.GenericPayload]{
 		ID:            nextID("evt"),
 		PluginID:      r.manifest.ID,
 		DeviceID:      evt.DeviceID,
@@ -507,8 +579,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 		Payload:       evt.Payload,
 		CreatedAt:     time.Now().UTC(),
 	}
-
-	updated, err := r.plugin.OnEvent(event, ent)
+	updated, err := r.plugin.OnEventTyped(event, ent)
 	if err != nil {
 		return types.Entity{}, err
 	}
@@ -527,6 +598,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	updated.Data.UpdatedAt = time.Now().UTC()
 	r.saveEntity(updated)
 
+	envelopePayload, _ := json.Marshal(event.Payload)
 	envelope := types.EntityEventEnvelope{
 		EventID:       event.ID,
 		PluginID:      event.PluginID,
@@ -534,7 +606,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 		EntityID:      event.EntityID,
 		EntityType:    event.EntityType,
 		CorrelationID: event.CorrelationID,
-		Payload:       event.Payload,
+		Payload:       envelopePayload,
 		CreatedAt:     event.CreatedAt,
 	}
 	if data, err := json.Marshal(envelope); err == nil {
@@ -628,16 +700,28 @@ func (r *Runner) handleEntitySearch(m *nats.Msg) {
 	}
 }
 
-func matchesLabels(have, want map[string]string) bool {
+func matchesLabels(have, want map[string][]string) bool {
 	if len(want) == 0 {
 		return true
 	}
 	if have == nil {
 		return false
 	}
-	for k, v := range want {
-		val, ok := have[k]
-		if !ok || val != v {
+	for k, wantVals := range want {
+		haveVals := have[k]
+		matched := false
+		for _, w := range wantVals {
+			for _, h := range haveVals {
+				if h == w {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
 			return false
 		}
 	}

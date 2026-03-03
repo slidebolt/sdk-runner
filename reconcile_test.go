@@ -12,7 +12,7 @@ func TestReconcileDevice(t *testing.T) {
 		SourceID:   "hw-mac-001",
 		SourceName: "Old HW Name",
 		LocalName:  "Basement Bar 01", // User provided
-		Labels:     map[string]string{"room": "basement"},
+		Labels:     map[string][]string{"room": {"basement"}},
 	}
 
 	discovered := types.Device{
@@ -20,7 +20,7 @@ func TestReconcileDevice(t *testing.T) {
 		SourceID:   "hw-mac-001",
 		SourceName: "New HW Firmware Name",
 		LocalName:  "Should Be Ignored", // Hardware trying to set local name
-		Labels:     map[string]string{"type": "light"}, // Hardware provided labels
+		Labels:     map[string][]string{"type": {"light"}}, // Hardware provided labels
 	}
 
 	result := ReconcileDevice(existing, discovered)
@@ -41,11 +41,11 @@ func TestReconcileDevice(t *testing.T) {
 	}
 
 	// 4. Labels should merge, existing takes precedence on conflict
-	if result.Labels["room"] != "basement" {
-		t.Errorf("expected room label to be preserved")
+	if len(result.Labels["room"]) == 0 || result.Labels["room"][0] != "basement" {
+		t.Errorf("expected room label to be preserved, got %v", result.Labels["room"])
 	}
-	if result.Labels["type"] != "light" {
-		t.Errorf("expected type label to be merged in")
+	if len(result.Labels["type"]) == 0 || result.Labels["type"][0] != "light" {
+		t.Errorf("expected type label to be merged in, got %v", result.Labels["type"])
 	}
 }
 

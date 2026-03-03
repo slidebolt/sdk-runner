@@ -8,6 +8,8 @@ require (
 	github.com/yuin/gopher-lua v1.1.1
 )
 
+replace github.com/slidebolt/sdk-types => ../sdk-types
+
 require (
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect

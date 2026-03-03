@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/slidebolt/sdk-types"
@@ -27,7 +28,7 @@ type Config struct {
 // the system after completing last-mile work (e.g. after an HTTP call to
 // a real device confirms a command was applied).
 type EventSink interface {
-	EmitEvent(evt types.InboundEvent) error
+	EmitTypedEvent(evt types.InboundEventTyped[types.GenericPayload]) error
 }
 
 // Plugin is the interface every plugin must implement.
@@ -37,6 +38,7 @@ type Plugin interface {
 	// Lifecycle
 	OnInitialize(config Config, state types.Storage) (types.Manifest, types.Storage)
 	OnReady()
+	WaitReady(ctx context.Context) error
 	OnShutdown()
 	OnHealthCheck() (string, error)
 	OnStorageUpdate(current types.Storage) (types.Storage, error)
@@ -54,9 +56,7 @@ type Plugin interface {
 	OnEntityDelete(deviceID, entityID string) error
 	OnEntitiesList(deviceID string, current []types.Entity) ([]types.Entity, error)
 
-	// Commands and Events — EntityType is always derived from entity.Domain by
-	// the runner. Plugins pattern-match on cmd.EntityType / evt.EntityType and
-	// dispatch to whichever entity packages they have imported.
-	OnCommand(cmd types.Command, entity types.Entity) (types.Entity, error)
-	OnEvent(evt types.Event, entity types.Entity) (types.Entity, error)
+	// Commands and Events
+	OnCommandTyped(req types.CommandRequest[types.GenericPayload], entity types.Entity) (types.Entity, error)
+	OnEventTyped(evt types.EventTyped[types.GenericPayload], entity types.Entity) (types.Entity, error)
 }
