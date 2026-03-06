@@ -54,6 +54,88 @@ func ReconcileDevices(existingMap map[string]types.Device, discovered []types.De
 	return out
 }
 
+// ReconcileEntity applies the same ownership wall as ReconcileDevice, but for entities.
+func ReconcileEntity(existing types.Entity, discovered types.Entity) types.Entity {
+	// New entity from discovery: sanitize user-owned fields.
+	if existing.ID == "" {
+		discovered.LocalName = ""
+		if discovered.Labels == nil {
+			discovered.Labels = make(map[string][]string)
+		}
+		return discovered
+	}
+
+	result := existing
+
+	// Hardware/plugin-owned capabilities always win.
+	result.Domain = discovered.Domain
+	result.Actions = discovered.Actions
+
+	// User-owned LocalName stays from existing.
+	// (result.LocalName already comes from existing)
+
+	// Merge labels with user values taking precedence.
+	if result.Labels == nil {
+		result.Labels = make(map[string][]string)
+	}
+	for k, v := range discovered.Labels {
+		if _, ok := result.Labels[k]; !ok {
+			result.Labels[k] = v
+		}
+	}
+
+	// System-owned state remains from existing.
+	result.Data = existing.Data
+	return result
+}
+
+func ReconcileDevicesAdditive(existing []types.Device, discovered []types.Device) []types.Device {
+	existingByID := make(map[string]types.Device, len(existing))
+	for _, d := range existing {
+		existingByID[d.ID] = d
+	}
+	out := make([]types.Device, 0, len(existing)+len(discovered))
+	seen := make(map[string]struct{}, len(existing)+len(discovered))
+	for _, d := range discovered {
+		ex := existingByID[d.ID]
+		merged := ReconcileDevice(ex, d)
+		out = append(out, merged)
+		seen[d.ID] = struct{}{}
+	}
+	for _, d := range existing {
+		if _, ok := seen[d.ID]; ok {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func ReconcileEntitiesAdditive(existing []types.Entity, discovered []types.Entity, deviceID string) []types.Entity {
+	existingByID := make(map[string]types.Entity, len(existing))
+	for _, e := range existing {
+		existingByID[e.ID] = e
+	}
+	out := make([]types.Entity, 0, len(existing)+len(discovered))
+	seen := make(map[string]struct{}, len(existing)+len(discovered))
+	for _, e := range discovered {
+		ex := existingByID[e.ID]
+		merged := ReconcileEntity(ex, e)
+		if merged.DeviceID == "" {
+			merged.DeviceID = deviceID
+		}
+		out = append(out, merged)
+		seen[e.ID] = struct{}{}
+	}
+	for _, e := range existing {
+		if _, ok := seen[e.ID]; ok {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // EnsureCoreDevice guarantees that the plugin's management device (ID = pluginID) is present
 // in the device list. Call this at the end of OnDevicesList.
 func EnsureCoreDevice(pluginID string, current []types.Device) []types.Device {

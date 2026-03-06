@@ -266,18 +266,26 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "devices/list":
 		current := r.loadDevices()
-		list, err := r.plugin.OnDevicesList(current)
+		discovered, err := r.plugin.OnDevicesList(current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
-			// Persist discovered devices so first-time discovery is durable.
-			for _, dev := range list {
+			merged := ReconcileDevicesAdditive(current, discovered)
+			for _, dev := range merged {
 				if strings.TrimSpace(dev.ID) == "" {
 					continue
 				}
 				r.saveDevice(dev)
 			}
-			result = list
+			result = merged
+		}
+
+	case "devices/refresh":
+		refreshed, err := r.refreshDevices()
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = refreshed
 		}
 
 	case "entities/create":
@@ -354,12 +362,12 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			break
 		}
 		current := r.loadEntities(params.DeviceID)
-		list, err := r.plugin.OnEntitiesList(params.DeviceID, current)
+		discovered, err := r.plugin.OnEntitiesList(params.DeviceID, current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
-			// Persist discovered entities so entity state survives restarts.
-			for _, ent := range list {
+			merged := ReconcileEntitiesAdditive(current, discovered, params.DeviceID)
+			for _, ent := range merged {
 				if strings.TrimSpace(ent.ID) == "" {
 					continue
 				}
@@ -371,7 +379,22 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 				}
 				r.saveEntity(ent)
 			}
-			result = list
+			result = merged
+		}
+
+	case "entities/refresh":
+		var params struct {
+			DeviceID string `json:"device_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		refreshed, err := r.refreshEntities(params.DeviceID)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = refreshed
 		}
 
 	case "entities/commands/create":
@@ -731,15 +754,38 @@ func (r *Runner) handlePluginSearch(m *nats.Msg) {
 	if err := json.Unmarshal(m.Data, &q); err != nil {
 		return
 	}
-	if match, _ := filepath.Match(q.Pattern, r.manifest.Name); match {
-		data, err := json.Marshal(r.manifest)
-		if err != nil {
-			log.Printf("plugin-runner: failed to marshal plugin search result: %v", err)
-			return
+	var matches []types.Manifest
+	qLower := strings.ToLower(q.Pattern)
+
+	if qLower != "" && qLower != "*" {
+		matched := false
+		if strings.Contains(strings.ToLower(r.manifest.ID), qLower) ||
+			strings.Contains(strings.ToLower(r.manifest.Name), qLower) {
+			matched = true
 		}
-		if err := m.Respond(data); err != nil {
-			log.Printf("plugin-runner: failed to respond to plugin search: %v", err)
+		if matched {
+			matches = append(matches, r.manifest)
 		}
+	} else {
+		if match, _ := filepath.Match(q.Pattern, r.manifest.Name); match {
+			matches = append(matches, r.manifest)
+		}
+	}
+
+	if matches == nil {
+		matches = []types.Manifest{}
+	}
+	res := types.SearchPluginsResponse{
+		PluginID: r.manifest.ID,
+		Matches:  matches,
+	}
+	data, err := json.Marshal(res)
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal plugin search result: %v", err)
+		return
+	}
+	if err := m.Respond(data); err != nil {
+		log.Printf("plugin-runner: failed to respond to plugin search: %v", err)
 	}
 }
 
@@ -749,24 +795,58 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 		return
 	}
 	var matches []types.Device
+	qLower := strings.ToLower(q.Pattern)
 	for _, d := range r.loadDevices() {
-		if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
-			continue
-		}
 		if !matchesLabels(d.Labels, q.Labels) {
 			continue
 		}
+
+		if qLower != "" && qLower != "*" {
+			matched := false
+			if strings.Contains(strings.ToLower(d.ID), qLower) ||
+				strings.Contains(strings.ToLower(d.SourceID), qLower) ||
+				strings.Contains(strings.ToLower(d.SourceName), qLower) ||
+				strings.Contains(strings.ToLower(d.LocalName), qLower) {
+				matched = true
+			}
+			if !matched {
+				for _, vals := range d.Labels {
+					for _, v := range vals {
+						if strings.Contains(strings.ToLower(v), qLower) {
+							matched = true
+							break
+						}
+					}
+					if matched {
+						break
+					}
+				}
+			}
+			if !matched {
+				continue
+			}
+		} else if q.Pattern != "" {
+			if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
+				continue
+			}
+		}
+
 		matches = append(matches, d)
 	}
-	if len(matches) > 0 {
-		data, err := json.Marshal(matches)
-		if err != nil {
-			log.Printf("plugin-runner: failed to marshal device search results: %v", err)
-			return
-		}
-		if err := m.Respond(data); err != nil {
-			log.Printf("plugin-runner: failed to respond to device search: %v", err)
-		}
+	if matches == nil {
+		matches = []types.Device{}
+	}
+	res := types.SearchDevicesResponse{
+		PluginID: r.manifest.ID,
+		Matches:  matches,
+	}
+	data, err := json.Marshal(res)
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal device search results: %v", err)
+		return
+	}
+	if err := m.Respond(data); err != nil {
+		log.Printf("plugin-runner: failed to respond to device search: %v", err)
 	}
 }
 
@@ -776,28 +856,58 @@ func (r *Runner) handleEntitySearch(m *nats.Msg) {
 		return
 	}
 	var matches []types.Entity
+	qLower := strings.ToLower(q.Pattern)
 	for _, d := range r.loadDevices() {
 		for _, e := range r.loadEntities(d.ID) {
-			if q.Pattern != "" {
+			if !matchesLabels(e.Labels, q.Labels) {
+				continue
+			}
+
+			if qLower != "" && qLower != "*" {
+				matched := false
+				if strings.Contains(strings.ToLower(e.ID), qLower) ||
+					strings.Contains(strings.ToLower(e.LocalName), qLower) {
+					matched = true
+				}
+				if !matched {
+					for _, vals := range e.Labels {
+						for _, v := range vals {
+							if strings.Contains(strings.ToLower(v), qLower) {
+								matched = true
+								break
+							}
+						}
+						if matched {
+							break
+						}
+					}
+				}
+				if !matched {
+					continue
+				}
+			} else if q.Pattern != "" {
 				if ok, _ := filepath.Match(q.Pattern, e.ID); !ok {
 					continue
 				}
 			}
-			if !matchesLabels(e.Labels, q.Labels) {
-				continue
-			}
+
 			matches = append(matches, e)
 		}
 	}
-	if len(matches) > 0 {
-		data, err := json.Marshal(matches)
-		if err != nil {
-			log.Printf("plugin-runner: failed to marshal entity search results: %v", err)
-			return
-		}
-		if err := m.Respond(data); err != nil {
-			log.Printf("plugin-runner: failed to respond to entity search: %v", err)
-		}
+	if matches == nil {
+		matches = []types.Entity{}
+	}
+	res := types.SearchEntitiesResponse{
+		PluginID: r.manifest.ID,
+		Matches:  matches,
+	}
+	data, err := json.Marshal(res)
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal entity search results: %v", err)
+		return
+	}
+	if err := m.Respond(data); err != nil {
+		log.Printf("plugin-runner: failed to respond to entity search: %v", err)
 	}
 }
 
@@ -903,6 +1013,47 @@ func (r *Runner) callCreateCommand(pluginID, deviceID, entityID string, payload 
 		return types.CommandStatus{}, err
 	}
 	return out, nil
+}
+
+func (r *Runner) refreshDevices() ([]types.Device, error) {
+	current := r.loadDevices()
+	discovered, err := r.plugin.OnDevicesList(current)
+	if err != nil {
+		return nil, err
+	}
+	merged := ReconcileDevicesAdditive(current, discovered)
+	for _, dev := range merged {
+		if strings.TrimSpace(dev.ID) == "" {
+			continue
+		}
+		r.saveDevice(dev)
+		if _, err := r.refreshEntities(dev.ID); err != nil {
+			return nil, err
+		}
+	}
+	return merged, nil
+}
+
+func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
+	current := r.loadEntities(deviceID)
+	discovered, err := r.plugin.OnEntitiesList(deviceID, current)
+	if err != nil {
+		return nil, err
+	}
+	merged := ReconcileEntitiesAdditive(current, discovered, deviceID)
+	for _, ent := range merged {
+		if strings.TrimSpace(ent.ID) == "" {
+			continue
+		}
+		if strings.TrimSpace(ent.DeviceID) == "" {
+			ent.DeviceID = deviceID
+		}
+		if strings.TrimSpace(ent.DeviceID) == "" {
+			continue
+		}
+		r.saveEntity(ent)
+	}
+	return merged, nil
 }
 
 func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcErr *types.RPCError) {
