@@ -28,7 +28,7 @@ jobs:
 
       - name: Update internal SDK dependencies
         run: |
-          grep "github.com/slidebolt/sdk" go.mod | awk '{print $1"@latest"}' | xargs go get
+          grep -E '^	' go.mod | grep 'github.com/slidebolt/sdk' | awk '{print $1"@latest"}' | xargs -r go get
           go mod tidy
 
       - name: Bump version
