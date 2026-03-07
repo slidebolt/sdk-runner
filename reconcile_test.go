@@ -81,7 +81,7 @@ func TestReconcileEntity(t *testing.T) {
 		LocalName: "Desk Lamp",
 		Actions:   []string{"toggle"},
 		Data: types.EntityData{
-			SyncStatus: "in_sync",
+			SyncStatus: types.SyncStatusSynced,
 		},
 		Labels: map[string][]string{"room": {"office"}},
 	}
@@ -93,7 +93,7 @@ func TestReconcileEntity(t *testing.T) {
 		LocalName: "Ignored By Wall",
 		Actions:   []string{"turn_on", "turn_off"},
 		Data: types.EntityData{
-			SyncStatus: "pending",
+			SyncStatus: types.SyncStatusPending,
 		},
 		Labels: map[string][]string{"type": {"lamp"}},
 	}
@@ -108,7 +108,7 @@ func TestReconcileEntity(t *testing.T) {
 	if result.LocalName != "Desk Lamp" {
 		t.Fatalf("expected user local name to be preserved, got %q", result.LocalName)
 	}
-	if result.Data.SyncStatus != "in_sync" {
+	if result.Data.SyncStatus != types.SyncStatusSynced {
 		t.Fatalf("expected existing data to be preserved, got %q", result.Data.SyncStatus)
 	}
 	if len(result.Labels["room"]) == 0 || result.Labels["room"][0] != "office" {

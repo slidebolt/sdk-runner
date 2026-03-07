@@ -98,11 +98,11 @@ func TestSaveEntityConcurrentNoCorruption(t *testing.T) {
 					Domain:   "switch",
 					LocalName: "entity",
 					Data: types.EntityData{
-						SyncStatus: "in_sync",
+						SyncStatus: types.SyncStatusSynced,
 					},
 				}
 				if (w+i)%2 == 0 {
-					e.Data.SyncStatus = "pending"
+					e.Data.SyncStatus = types.SyncStatusPending
 				}
 				r.saveEntity(e)
 				_ = r.loadEntity(deviceID, entityID)
@@ -133,4 +133,3 @@ func TestSaveEntityConcurrentNoCorruption(t *testing.T) {
 		t.Fatalf("unexpected entity content: id=%q device=%q", ent.ID, ent.DeviceID)
 	}
 }
-

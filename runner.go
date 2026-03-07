@@ -294,7 +294,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		ent.Data.SyncStatus = "in_sync"
+		ent.Data.SyncStatus = types.SyncStatusSynced
 		ent.Data.UpdatedAt = time.Now().UTC()
 		created, err := r.plugin.OnEntityCreate(ent)
 		if err != nil {
@@ -609,7 +609,7 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	r.setCommandStatus(status)
 
 	ent.Data.LastCommandID = cmd.ID
-	ent.Data.SyncStatus = "pending"
+	ent.Data.SyncStatus = types.SyncStatusPending
 	ent.Data.UpdatedAt = now
 
 	updated, err := r.plugin.OnCommand(cmd, ent)
@@ -618,15 +618,15 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 		status.Error = err.Error()
 		status.LastUpdatedAt = time.Now().UTC()
 		r.setCommandStatus(status)
-		ent.Data.SyncStatus = "failed"
+		ent.Data.SyncStatus = types.SyncStatusFailed
 		ent.Data.UpdatedAt = status.LastUpdatedAt
 		r.saveEntity(ent)
 		return types.CommandStatus{}, err
 	}
 
 	updated.Data.LastCommandID = cmd.ID
-	if updated.Data.SyncStatus == "" {
-		updated.Data.SyncStatus = "pending"
+	if updated.Data.SyncStatus == types.SyncStatusEmpty {
+		updated.Data.SyncStatus = types.SyncStatusPending
 	}
 	updated.Data.UpdatedAt = time.Now().UTC()
 	r.saveEntity(updated)
@@ -637,14 +637,15 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 // EmitEvent satisfies EventSink, letting plugin code publish provider-originated
 // events back into the system after completing last-mile work.
 func (r *Runner) EmitEvent(evt types.InboundEvent) error {
-	if r.nc == nil {
-		return nil // No-op in discovery mode
-	}
 	_, err := r.processInboundEvent(evt)
 	return err
 }
 
 func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, error) {
+	if _, err := requiredEventType(evt.Payload); err != nil {
+		return types.Entity{}, err
+	}
+
 	ent := r.resolveEntity(evt.DeviceID, evt.EntityID)
 	if ent.ID == "" {
 		return types.Entity{}, fmt.Errorf("entity not found")
@@ -672,9 +673,10 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 			updated.Data.LastCommandID = event.CorrelationID
 		}
 	}
-	if updated.Data.SyncStatus == "" || updated.Data.SyncStatus == "pending" {
-		updated.Data.SyncStatus = "in_sync"
+	if updated.Data.SyncStatus == types.SyncStatusEmpty || updated.Data.SyncStatus == types.SyncStatusPending {
+		updated.Data.SyncStatus = types.SyncStatusSynced
 	}
+	updated.Data.SyncStatus = types.NormalizeSyncStatus(updated.Data.SyncStatus)
 	updated.Data.UpdatedAt = time.Now().UTC()
 	r.saveEntity(updated)
 
@@ -694,12 +696,28 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	}
 	if data, err := json.Marshal(envelope); err != nil {
 		log.Printf("plugin-runner: failed to marshal event envelope: %v", err)
-	} else if err := r.nc.Publish(SubjectEntityEvents, data); err != nil {
-		log.Printf("plugin-runner: failed to publish entity event: %v", err)
+	} else if r.nc != nil {
+		if err := r.nc.Publish(SubjectEntityEvents, data); err != nil {
+			log.Printf("plugin-runner: failed to publish entity event: %v", err)
+		}
 	}
 	go r.dispatchLuaEvent(envelope)
 
 	return updated, nil
+}
+
+func requiredEventType(payload json.RawMessage) (string, error) {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return "", fmt.Errorf("event payload must be valid JSON object with required field \"type\": %w", err)
+	}
+	t := strings.TrimSpace(probe.Type)
+	if t == "" {
+		return "", fmt.Errorf("event payload missing required field \"type\"")
+	}
+	return t, nil
 }
 
 func (r *Runner) handleRegistration(m *nats.Msg) {
