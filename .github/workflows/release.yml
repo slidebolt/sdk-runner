@@ -31,6 +31,10 @@ jobs:
           grep -E '^	' go.mod | grep 'github.com/slidebolt/sdk' | awk '{print $1"@latest"}' | xargs -r go get
           go mod tidy
 
+
+      - name: Test
+        run: go test ./...
+
       - name: Bump version
         id: version
         run: |
