@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/nats-io/nats.go v1.49.0
-	github.com/slidebolt/sdk-types v1.5.6
+	github.com/slidebolt/sdk-types v1.20.0
 	github.com/yuin/gopher-lua v1.1.1
 )
 
