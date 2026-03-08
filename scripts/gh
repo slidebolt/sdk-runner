@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_GH="${REAL_GH_BIN:-/usr/bin/gh}"
+if [[ ! -x "$REAL_GH" ]]; then
+  REAL_GH="$(command -v gh)"
+fi
+
+if [[ "${1:-}" == "workflow" && "${2:-}" == "run" ]]; then
+  if [[ "${ALLOW_DIRECT_GH_WORKFLOW_RUN:-}" != "1" ]]; then
+    echo "BLOCKED: direct 'gh workflow run' is disabled in this repo."
+    echo "Use: scripts/release-safe.sh [patch|minor|major]"
+    exit 2
+  fi
+fi
+
+exec "$REAL_GH" "$@"

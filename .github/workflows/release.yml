@@ -3,6 +3,10 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      release_guard:
+        description: "Guard token. Use scripts/release-safe.sh"
+        required: true
+        type: string
       bump:
         description: 'Version bump type'
         required: true
@@ -17,6 +21,16 @@ jobs:
       contents: write
 
     steps:
+      - name: Enforce release guard
+        if: github.event_name == "workflow_dispatch"
+        run: |
+          expected_sha256="aa7e759ce4be39c01631a26583b6df6546531a4b5047ce75f501f82f7fd729e8"
+          provided_sha256="$(printf '%s' "${{ github.event.inputs.release_guard }}" | sha256sum | awk '{print $1}')"
+          if [ "$provided_sha256" != "$expected_sha256" ]; then
+            echo "BLOCKED: run scripts/release-safe.sh"
+            exit 1
+          fi
+          echo "PASS: release guard validated"
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
