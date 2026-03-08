@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/slidebolt/sdk-types"
 	lua "github.com/yuin/gopher-lua"
 )
@@ -37,6 +39,8 @@ type scriptRuntime struct {
 
 type scriptQuery struct {
 	Text     string
+	Pattern  string
+	Labels   map[string][]string
 	PluginID string
 	DeviceID string
 	EntityID string
@@ -270,11 +274,14 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 			items := r.findEntities(query)
 			for _, ent := range items {
 				out.Append(mapToLTable(L, map[string]any{
-					"PluginID":  ent.PluginID,
-					"DeviceID":  ent.DeviceID,
-					"EntityID":  ent.EntityID,
-					"Domain":    ent.Domain,
-					"LocalName": ent.LocalName,
+					"PluginID":   ent.PluginID,
+					"DeviceID":   ent.DeviceID,
+					"EntityID":   ent.EntityID,
+					"Domain":     ent.Domain,
+					"SourceID":   ent.SourceID,
+					"SourceName": ent.SourceName,
+					"LocalName":  ent.LocalName,
+					"Labels":     ent.Labels,
 				}))
 			}
 			L.Push(out)
@@ -299,6 +306,88 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 				"State":     string(status.State),
 				"Error":     status.Error,
 			}))
+			L.Push(lua.LNil)
+			return 2
+		},
+		"SendBatchCommands": func(L *lua.LState) int {
+			items, parseErr := sendBatchCommandArgs(L, 2)
+			if parseErr != "" {
+				L.Push(lua.LNil)
+				L.Push(lua.LString(parseErr))
+				return 2
+			}
+			batchStart := time.Now()
+			if r.logger != nil {
+				r.logger.Log(context.Background(), LevelTrace, "lua batch start",
+					"device_id", rt.key.DeviceID,
+					"entity_id", rt.key.EntityID,
+					"count", len(items),
+					"start_unix_ms", batchStart.UnixMilli())
+			}
+			out := L.NewTable()
+			for idx, item := range items {
+				itemStart := time.Now()
+				if r.logger != nil {
+					r.logger.Log(context.Background(), LevelTrace, "lua batch item dispatch",
+						"device_id", rt.key.DeviceID,
+						"entity_id", rt.key.EntityID,
+						"index", idx,
+						"plugin_id", item.PluginID,
+						"target_device_id", item.DeviceID,
+						"target_entity_id", item.EntityID,
+						"start_unix_ms", itemStart.UnixMilli())
+				}
+				body, _ := json.Marshal(item.Payload)
+				status, err := r.callCreateCommand(item.PluginID, item.DeviceID, item.EntityID, body)
+				result := map[string]any{
+					"PluginID": item.PluginID,
+					"DeviceID": item.DeviceID,
+					"EntityID": item.EntityID,
+				}
+				if err != nil {
+					result["OK"] = false
+					result["Error"] = err.Error()
+					if r.logger != nil {
+						r.logger.Log(context.Background(), LevelTrace, "lua batch item result",
+							"device_id", rt.key.DeviceID,
+							"entity_id", rt.key.EntityID,
+							"index", idx,
+							"plugin_id", item.PluginID,
+							"target_device_id", item.DeviceID,
+							"target_entity_id", item.EntityID,
+							"ok", false,
+							"error", err.Error(),
+							"elapsed_ms", time.Since(itemStart).Milliseconds())
+					}
+				} else {
+					result["OK"] = true
+					result["CommandID"] = status.CommandID
+					result["State"] = string(status.State)
+					result["Error"] = status.Error
+					if r.logger != nil {
+						r.logger.Log(context.Background(), LevelTrace, "lua batch item result",
+							"device_id", rt.key.DeviceID,
+							"entity_id", rt.key.EntityID,
+							"index", idx,
+							"plugin_id", item.PluginID,
+							"target_device_id", item.DeviceID,
+							"target_entity_id", item.EntityID,
+							"command_id", status.CommandID,
+							"state", string(status.State),
+							"ok", true,
+							"elapsed_ms", time.Since(itemStart).Milliseconds())
+					}
+				}
+				out.Append(mapToLTable(L, result))
+			}
+			if r.logger != nil {
+				r.logger.Log(context.Background(), LevelTrace, "lua batch done",
+					"device_id", rt.key.DeviceID,
+					"entity_id", rt.key.EntityID,
+					"count", len(items),
+					"elapsed_ms", time.Since(batchStart).Milliseconds())
+			}
+			L.Push(out)
 			L.Push(lua.LNil)
 			return 2
 		},
@@ -364,6 +453,7 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 					"SourceID":   dev.SourceID,
 					"SourceName": dev.SourceName,
 					"LocalName":  dev.LocalName,
+					"Labels":     dev.Labels,
 				}))
 			}
 			L.Push(out)
@@ -380,12 +470,16 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 				return 2
 			}
 			L.Push(mapToLTable(L, map[string]any{
-				"PluginID":  pluginID,
-				"DeviceID":  ent.DeviceID,
-				"EntityID":  ent.ID,
-				"Domain":    ent.Domain,
-				"LocalName": ent.LocalName,
-				"Actions":   toAnySlice(ent.Actions),
+				"PluginID":   pluginID,
+				"DeviceID":   ent.DeviceID,
+				"EntityID":   ent.ID,
+				"Domain":     ent.Domain,
+				"SourceID":   ent.SourceID,
+				"SourceName": ent.SourceName,
+				"LocalName":  ent.LocalName,
+				"Actions":    toAnySlice(ent.Actions),
+				"Labels":     ent.Labels,
+				"Data":       entityDataToMap(ent.Data),
 			}))
 			L.Push(lua.LNil)
 			return 2
@@ -419,100 +513,56 @@ type foundDevice struct {
 	SourceID   string
 	SourceName string
 	LocalName  string
+	Labels     map[string][]string
 }
 
 type foundEntity struct {
-	PluginID  string
-	DeviceID  string
-	EntityID  string
-	Domain    string
-	LocalName string
+	PluginID   string
+	DeviceID   string
+	EntityID   string
+	Domain     string
+	SourceID   string
+	SourceName string
+	LocalName  string
+	Labels     map[string][]string
 }
 
 func (r *Runner) findDevices(query scriptQuery) []foundDevice {
-	filter := strings.TrimSpace(strings.ToLower(query.Text))
-	results := make([]foundDevice, 0)
-
-	registry := r.snapshotRegistry()
-	for pluginID := range registry {
-		if query.PluginID != "" && pluginID != query.PluginID {
-			continue
-		}
-		devices, err := r.callListDevices(pluginID)
-		if err != nil {
-			continue
-		}
-		for _, dev := range devices {
-			if query.DeviceID != "" && dev.ID != query.DeviceID {
-				continue
-			}
-			if filter != "" &&
-				!strings.Contains(strings.ToLower(pluginID), filter) &&
-				!strings.Contains(strings.ToLower(dev.ID), filter) &&
-				!strings.Contains(strings.ToLower(dev.SourceID), filter) &&
-				!strings.Contains(strings.ToLower(dev.LocalName), filter) {
-				continue
-			}
-			results = append(results, foundDevice{
-				PluginID:   pluginID,
-				DeviceID:   dev.ID,
-				SourceID:   dev.SourceID,
-				SourceName: dev.SourceName,
-				LocalName:  dev.LocalName,
-			})
-			if query.Limit > 0 && len(results) >= query.Limit {
-				return results
-			}
-		}
+	pattern := strings.TrimSpace(query.Pattern)
+	if pattern == "" {
+		pattern = strings.TrimSpace(query.Text)
 	}
-	return results
+	if pattern == "" {
+		pattern = "*"
+	}
+	q := types.SearchQuery{
+		Pattern:  pattern,
+		Labels:   query.Labels,
+		PluginID: query.PluginID,
+		DeviceID: query.DeviceID,
+		Limit:    query.Limit,
+	}
+	return r.searchDevicesDistributed(q)
 }
 
 func (r *Runner) findEntities(query scriptQuery) []foundEntity {
-	filter := strings.TrimSpace(strings.ToLower(query.Text))
-	results := make([]foundEntity, 0)
-
-	registry := r.snapshotRegistry()
-	for pluginID := range registry {
-		if query.PluginID != "" && pluginID != query.PluginID {
-			continue
-		}
-		devices, err := r.callListDevices(pluginID)
-		if err != nil {
-			continue
-		}
-		for _, dev := range devices {
-			if query.DeviceID != "" && dev.ID != query.DeviceID {
-				continue
-			}
-			entities, err := r.callListEntities(pluginID, dev.ID)
-			if err != nil {
-				continue
-			}
-			for _, ent := range entities {
-				if query.EntityID != "" && ent.ID != query.EntityID {
-					continue
-				}
-				if query.Domain != "" && ent.Domain != query.Domain {
-					continue
-				}
-				if filter != "" && !strings.Contains(strings.ToLower(pluginID), filter) && !strings.Contains(strings.ToLower(ent.Domain), filter) {
-					continue
-				}
-				results = append(results, foundEntity{
-					PluginID:  pluginID,
-					DeviceID:  dev.ID,
-					EntityID:  ent.ID,
-					Domain:    ent.Domain,
-					LocalName: ent.LocalName,
-				})
-				if query.Limit > 0 && len(results) >= query.Limit {
-					return results
-				}
-			}
-		}
+	pattern := strings.TrimSpace(query.Pattern)
+	if pattern == "" {
+		pattern = strings.TrimSpace(query.Text)
 	}
-	return results
+	if pattern == "" {
+		pattern = "*"
+	}
+	q := types.SearchQuery{
+		Pattern:  pattern,
+		Labels:   query.Labels,
+		PluginID: query.PluginID,
+		DeviceID: query.DeviceID,
+		EntityID: query.EntityID,
+		Domain:   query.Domain,
+		Limit:    query.Limit,
+	}
+	return r.searchEntitiesDistributed(q)
 }
 
 func (r *Runner) getDevice(pluginID, deviceID string) (types.Device, error) {
@@ -561,16 +611,178 @@ func queryFromLuaArg(L *lua.LState, idx int) scriptQuery {
 			return scriptQuery{}
 		}
 		return scriptQuery{
-			Text:     getString(obj, "Text"),
-			PluginID: getString(obj, "PluginID"),
-			DeviceID: getString(obj, "DeviceID"),
-			EntityID: getString(obj, "EntityID"),
-			Domain:   getString(obj, "Domain"),
-			Limit:    getInt(obj, "Limit"),
+			Text:     getStringAny(obj, "Text", "text"),
+			Pattern:  getStringAny(obj, "Pattern", "pattern"),
+			Labels:   getLabelsAny(obj, "Labels", "labels"),
+			PluginID: getStringAny(obj, "PluginID", "plugin_id"),
+			DeviceID: getStringAny(obj, "DeviceID", "device_id"),
+			EntityID: getStringAny(obj, "EntityID", "entity_id"),
+			Domain:   getStringAny(obj, "Domain", "domain"),
+			Limit:    getIntAny(obj, "Limit", "limit"),
 		}
 	default:
 		return scriptQuery{}
 	}
+}
+
+func (r *Runner) searchDevicesDistributed(q types.SearchQuery) []foundDevice {
+	if r.nc == nil {
+		local := r.searchDevicesLocal(q)
+		out := make([]foundDevice, 0, len(local))
+		for _, d := range local {
+			out = append(out, foundDevice{
+				PluginID:   r.manifest.ID,
+				DeviceID:   d.ID,
+				SourceID:   d.SourceID,
+				SourceName: d.SourceName,
+				LocalName:  d.LocalName,
+				Labels:     d.Labels,
+			})
+		}
+		return out
+	}
+	data, _ := json.Marshal(q)
+	sub, err := r.nc.SubscribeSync(nats.NewInbox())
+	if err != nil {
+		local := r.searchDevicesLocal(q)
+		out := make([]foundDevice, 0, len(local))
+		for _, d := range local {
+			out = append(out, foundDevice{
+				PluginID:   r.manifest.ID,
+				DeviceID:   d.ID,
+				SourceID:   d.SourceID,
+				SourceName: d.SourceName,
+				LocalName:  d.LocalName,
+				Labels:     d.Labels,
+			})
+		}
+		return out
+	}
+	defer sub.Unsubscribe()
+	r.nc.PublishRequest(SubjectSearchDevices, sub.Subject, data)
+
+	results := make([]foundDevice, 0)
+	expected := r.expectedSearchPlugins(q.PluginID)
+	timeout := time.After(2 * time.Second)
+	for len(expected) > 0 {
+		select {
+		case <-timeout:
+			return applyFoundDeviceLimit(results, q.Limit)
+		default:
+			msg, err := sub.NextMsg(100 * time.Millisecond)
+			if err != nil {
+				continue
+			}
+			var res types.SearchDevicesResponse
+			if err := json.Unmarshal(msg.Data, &res); err != nil {
+				continue
+			}
+			delete(expected, res.PluginID)
+			for _, d := range res.Matches {
+				results = append(results, foundDevice{
+					PluginID:   res.PluginID,
+					DeviceID:   d.ID,
+					SourceID:   d.SourceID,
+					SourceName: d.SourceName,
+					LocalName:  d.LocalName,
+					Labels:     d.Labels,
+				})
+			}
+		}
+	}
+	return applyFoundDeviceLimit(results, q.Limit)
+}
+
+func (r *Runner) searchEntitiesDistributed(q types.SearchQuery) []foundEntity {
+	if r.nc == nil {
+		local := r.searchEntitiesLocal(q)
+		out := make([]foundEntity, 0, len(local))
+		for _, e := range local {
+			out = append(out, foundEntity{
+				PluginID:   r.manifest.ID,
+				DeviceID:   e.DeviceID,
+				EntityID:   e.ID,
+				Domain:     e.Domain,
+				SourceID:   e.SourceID,
+				SourceName: e.SourceName,
+				LocalName:  e.LocalName,
+				Labels:     e.Labels,
+			})
+		}
+		return out
+	}
+	data, _ := json.Marshal(q)
+	sub, err := r.nc.SubscribeSync(nats.NewInbox())
+	if err != nil {
+		local := r.searchEntitiesLocal(q)
+		out := make([]foundEntity, 0, len(local))
+		for _, e := range local {
+			out = append(out, foundEntity{
+				PluginID:   r.manifest.ID,
+				DeviceID:   e.DeviceID,
+				EntityID:   e.ID,
+				Domain:     e.Domain,
+				SourceID:   e.SourceID,
+				SourceName: e.SourceName,
+				LocalName:  e.LocalName,
+				Labels:     e.Labels,
+			})
+		}
+		return out
+	}
+	defer sub.Unsubscribe()
+	r.nc.PublishRequest(SubjectSearchEntities, sub.Subject, data)
+
+	results := make([]foundEntity, 0)
+	expected := r.expectedSearchPlugins(q.PluginID)
+	timeout := time.After(2 * time.Second)
+	for len(expected) > 0 {
+		select {
+		case <-timeout:
+			return applyFoundEntityLimit(results, q.Limit)
+		default:
+			msg, err := sub.NextMsg(100 * time.Millisecond)
+			if err != nil {
+				continue
+			}
+			var res types.SearchEntitiesResponse
+			if err := json.Unmarshal(msg.Data, &res); err != nil {
+				continue
+			}
+			delete(expected, res.PluginID)
+			for _, e := range res.Matches {
+				results = append(results, foundEntity{
+					PluginID:   res.PluginID,
+					DeviceID:   e.DeviceID,
+					EntityID:   e.ID,
+					Domain:     e.Domain,
+					SourceID:   e.SourceID,
+					SourceName: e.SourceName,
+					LocalName:  e.LocalName,
+					Labels:     e.Labels,
+				})
+			}
+		}
+	}
+	return applyFoundEntityLimit(results, q.Limit)
+}
+
+func (r *Runner) expectedSearchPlugins(pluginID string) map[string]bool {
+	expected := make(map[string]bool)
+	reg := r.snapshotRegistry()
+	for id := range reg {
+		if pluginID != "" && pluginID != id {
+			continue
+		}
+		expected[id] = true
+	}
+	if len(expected) == 0 && pluginID != "" {
+		expected[pluginID] = true
+	}
+	if len(expected) == 0 && pluginID == "" && r.manifest.ID != "" {
+		expected[r.manifest.ID] = true
+	}
+	return expected
 }
 
 func sendCommandArgs(L *lua.LState) (pluginID, deviceID, entityID string, payload any) {
@@ -615,6 +827,53 @@ func emitEventArgs(L *lua.LState) (deviceID, entityID string, payload any, corre
 	return strings.TrimSpace(L.CheckString(2)), strings.TrimSpace(L.CheckString(3)), lValueToAny(L.CheckAny(4)), strings.TrimSpace(L.OptString(5, ""))
 }
 
+type luaBatchCommand struct {
+	PluginID string
+	DeviceID string
+	EntityID string
+	Payload  any
+}
+
+func sendBatchCommandArgs(L *lua.LState, idx int) ([]luaBatchCommand, string) {
+	v := L.Get(idx)
+	tbl, ok := v.(*lua.LTable)
+	if !ok {
+		return nil, "batch commands must be a table"
+	}
+	raw := lValueToAny(tbl)
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, "batch commands must be an array"
+	}
+	out := make([]luaBatchCommand, 0, len(items))
+	for i, item := range items {
+		obj, _ := item.(map[string]any)
+		if obj == nil {
+			return nil, fmt.Sprintf("batch command %d must be an object", i+1)
+		}
+		pluginID := getStringAny(obj, "PluginID", "plugin_id")
+		deviceID := getStringAny(obj, "DeviceID", "device_id")
+		entityID := getStringAny(obj, "EntityID", "entity_id")
+		if pluginID == "" || deviceID == "" || entityID == "" {
+			return nil, fmt.Sprintf("batch command %d missing PluginID/DeviceID/EntityID", i+1)
+		}
+		payload := obj["Payload"]
+		if payload == nil {
+			payload = obj["payload"]
+		}
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		out = append(out, luaBatchCommand{
+			PluginID: pluginID,
+			DeviceID: deviceID,
+			EntityID: entityID,
+			Payload:  payload,
+		})
+	}
+	return out, ""
+}
+
 func getString(m map[string]any, key string) string {
 	v, ok := m[key]
 	if !ok {
@@ -622,6 +881,15 @@ func getString(m map[string]any, key string) string {
 	}
 	s, _ := v.(string)
 	return strings.TrimSpace(s)
+}
+
+func getStringAny(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if v := getString(m, key); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func getInt(m map[string]any, key string) int {
@@ -641,6 +909,15 @@ func getInt(m map[string]any, key string) int {
 	}
 }
 
+func getIntAny(m map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if v := getInt(m, key); v != 0 {
+			return v
+		}
+	}
+	return 0
+}
+
 func getMapAny(m map[string]any, key string) map[string]any {
 	v, ok := m[key]
 	if !ok || v == nil {
@@ -657,6 +934,69 @@ func getMapAny(m map[string]any, key string) map[string]any {
 		}
 		return map[string]any{}
 	}
+}
+
+func getLabelsAny(m map[string]any, keys ...string) map[string][]string {
+	for _, key := range keys {
+		raw, ok := m[key]
+		if !ok || raw == nil {
+			continue
+		}
+		out := normalizeLabels(raw)
+		if len(out) > 0 {
+			return out
+		}
+		return map[string][]string{}
+	}
+	return nil
+}
+
+func normalizeLabels(raw any) map[string][]string {
+	switch x := raw.(type) {
+	case map[string][]string:
+		return x
+	case map[string]any:
+		out := make(map[string][]string, len(x))
+		for k, v := range x {
+			switch vv := v.(type) {
+			case string:
+				if strings.TrimSpace(vv) != "" {
+					out[k] = []string{strings.TrimSpace(vv)}
+				}
+			case []string:
+				if len(vv) > 0 {
+					out[k] = vv
+				}
+			case []any:
+				values := make([]string, 0, len(vv))
+				for _, item := range vv {
+					if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+						values = append(values, strings.TrimSpace(s))
+					}
+				}
+				if len(values) > 0 {
+					out[k] = values
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func applyFoundDeviceLimit(items []foundDevice, limit int) []foundDevice {
+	if limit <= 0 || len(items) <= limit {
+		return items
+	}
+	return items[:limit]
+}
+
+func applyFoundEntityLimit(items []foundEntity, limit int) []foundEntity {
+	if limit <= 0 || len(items) <= limit {
+		return items
+	}
+	return items[:limit]
 }
 
 func (r *Runner) scriptPath(deviceID, entityID string) string {
@@ -900,6 +1240,21 @@ func jsonRawToAny(raw json.RawMessage) any {
 	var out any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{}
+	}
+	return out
+}
+
+func entityDataToMap(data types.EntityData) map[string]any {
+	out := map[string]any{
+		"desired":         jsonRawToAny(data.Desired),
+		"reported":        jsonRawToAny(data.Reported),
+		"effective":       jsonRawToAny(data.Effective),
+		"sync_status":     string(data.SyncStatus),
+		"last_command_id": data.LastCommandID,
+		"last_event_id":   data.LastEventID,
+	}
+	if !data.UpdatedAt.IsZero() {
+		out["updated_at"] = data.UpdatedAt.UnixMilli()
 	}
 	return out
 }

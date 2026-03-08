@@ -137,7 +137,7 @@ func (r *Runner) RunDebugUI() error {
 	initialState := r.loadState("default")
 	var updatedState types.Storage
 	fmt.Println(ui.Step(1, "Plugin", "Initializing..."))
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r}, initialState)
+	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
 	r.saveStateSynced("default", updatedState)
 	r.plugin.OnReady()
 	defer r.plugin.OnShutdown()

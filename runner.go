@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -44,6 +45,15 @@ type Runner struct {
 
 	hashMu   sync.RWMutex
 	fileHash map[string]string
+
+	logger   *slog.Logger
+	logLevel *slog.LevelVar
+
+	stateStore       stateStore
+	snapshotStore    stateStore
+	snapshotInterval time.Duration
+	snapshotStop     chan struct{}
+	snapshotDone     chan struct{}
 }
 
 var idSeq uint64
@@ -57,7 +67,8 @@ func NewRunner(p Plugin) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{
+	logger, levelVar := newLogger(defaultLogServiceName())
+	r := &Runner{
 		plugin:      p,
 		dataDir:     dataDir,
 		statuses:    make(map[string]types.CommandStatus),
@@ -65,7 +76,39 @@ func NewRunner(p Plugin) (*Runner, error) {
 		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
-	}, nil
+		logger:      logger,
+		logLevel:    levelVar,
+	}
+	r.stateStore = newMemoryStateStore()
+	r.snapshotStore = newStateStore(r, "file")
+	r.snapshotInterval = loadSnapshotInterval()
+	r.hydrateCanonicalFromSnapshot()
+	return r, nil
+}
+
+func (r *Runner) GetLogLevel() string {
+	if r == nil || r.logLevel == nil {
+		return "info"
+	}
+	return formatLogLevel(r.logLevel.Level())
+}
+
+func (r *Runner) SetLogLevel(level string) (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("runner is nil")
+	}
+	parsed, err := validateLogLevel(level)
+	if err != nil {
+		return "", err
+	}
+	if r.logLevel == nil {
+		r.logLevel = &slog.LevelVar{}
+	}
+	r.logLevel.Set(parsed)
+	if r.logger != nil {
+		r.logger.Info("log level updated", "level", formatLogLevel(parsed))
+	}
+	return formatLogLevel(parsed), nil
 }
 
 func (r *Runner) Run() error {
@@ -94,7 +137,7 @@ func (r *Runner) Run() error {
 
 	initialState := r.loadState("default")
 	var updatedState types.Storage
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r}, initialState)
+	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
 	r.rpcSubject = SubjectRPCPrefix + r.manifest.ID
 	r.saveStateSynced("default", updatedState)
 	r.plugin.OnReady()
@@ -105,17 +148,16 @@ func (r *Runner) Run() error {
 	}
 	waitCancel()
 
-	// Proactively initialize devices before accepting RPC traffic so that
-	// adapters and in-memory state are ready before the first command arrives.
-	if list, err := r.plugin.OnDevicesList(r.loadDevices()); err != nil {
-		log.Printf("plugin-runner: proactive OnDevicesList failed: %v", err)
-	} else {
-		for _, dev := range list {
-			if strings.TrimSpace(dev.ID) != "" {
-				r.saveDevice(dev)
-			}
-		}
+	// Enforce deterministic topology hydration before accepting RPC traffic:
+	// devices first, then entities for every known device.
+	if err := r.bootstrapStartupTopology(); err != nil {
+		return fmt.Errorf("startup topology hydration failed: %w", err)
 	}
+	r.startSnapshotLoop()
+	defer func() {
+		r.stopSnapshotLoop()
+		r.flushSnapshot()
+	}()
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
 	regData, err := json.Marshal(reg)
@@ -150,7 +192,7 @@ func (r *Runner) Run() error {
 func (r *Runner) runDiscoveryMode() error {
 	_ = os.MkdirAll(r.dataDir, 0o755)
 	initialState := r.loadState("default")
-	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r}, initialState)
+	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
 	r.plugin.OnReady()
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -194,6 +236,35 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 	case "initialize":
 		result = r.manifest
 
+	case "logging/get_level":
+		result = map[string]any{
+			"level": r.GetLogLevel(),
+		}
+
+	case "logging/set_level":
+		var payload struct {
+			Level string `json:"level"`
+		}
+		if len(req.Params) > 0 && string(req.Params) != "null" {
+			if err := json.Unmarshal(req.Params, &payload); err != nil || strings.TrimSpace(payload.Level) == "" {
+				var levelText string
+				if err2 := json.Unmarshal(req.Params, &levelText); err2 == nil {
+					payload.Level = levelText
+				} else if err != nil {
+					rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+					break
+				}
+			}
+		}
+		level, err := r.SetLogLevel(payload.Level)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: err.Error()}
+			break
+		}
+		result = map[string]any{
+			"level": level,
+		}
+
 	case "storage/update":
 		current := r.loadState("default")
 		updated, err := r.plugin.OnStorageUpdate(current)
@@ -210,13 +281,9 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created, err := r.plugin.OnDeviceCreate(dev)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveDevice(created)
-			result = created
-		}
+		created := r.createDeviceWithFallback(dev)
+		r.saveDevice(created)
+		result = created
 
 	case "devices/update":
 		var incoming types.Device
@@ -294,15 +361,9 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		ent.Data.SyncStatus = types.SyncStatusSynced
-		ent.Data.UpdatedAt = time.Now().UTC()
-		created, err := r.plugin.OnEntityCreate(ent)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveEntity(created)
-			result = created
-		}
+		created := r.createEntityWithFallback(ent)
+		r.saveEntity(created)
+		result = created
 
 	case "entities/update":
 		var incoming types.Entity
@@ -581,7 +642,27 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 }
 
 func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessage) (types.CommandStatus, error) {
+	cmdStart := time.Now()
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "create_command start",
+			"device_id", deviceID,
+			"entity_id", entityID,
+			"start_unix_ms", cmdStart.UnixMilli())
+	}
+	resolveStart := time.Now()
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "create_command resolve_entity start",
+			"device_id", deviceID,
+			"entity_id", entityID,
+			"start_unix_ms", resolveStart.UnixMilli())
+	}
 	ent := r.resolveEntity(deviceID, entityID)
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "create_command resolve_entity done",
+			"device_id", deviceID,
+			"entity_id", entityID,
+			"elapsed_ms", time.Since(resolveStart).Milliseconds())
+	}
 	if ent.ID == "" {
 		return types.CommandStatus{}, fmt.Errorf("entity not found")
 	}
@@ -612,7 +693,23 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	ent.Data.SyncStatus = types.SyncStatusPending
 	ent.Data.UpdatedAt = now
 
+	onCommandStart := time.Now()
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "create_command on_command start",
+			"command_id", cmd.ID,
+			"device_id", deviceID,
+			"entity_id", entityID,
+			"start_unix_ms", onCommandStart.UnixMilli())
+	}
 	updated, err := r.plugin.OnCommand(cmd, ent)
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "create_command on_command done",
+			"command_id", cmd.ID,
+			"device_id", deviceID,
+			"entity_id", entityID,
+			"elapsed_ms", time.Since(onCommandStart).Milliseconds(),
+			"ok", err == nil)
+	}
 	if err != nil {
 		status.State = types.CommandFailed
 		status.Error = err.Error()
@@ -620,7 +717,19 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 		r.setCommandStatus(status)
 		ent.Data.SyncStatus = types.SyncStatusFailed
 		ent.Data.UpdatedAt = status.LastUpdatedAt
-		r.saveEntity(ent)
+		entCopy := ent
+		go func() {
+			persistStart := time.Now()
+			r.saveEntity(entCopy)
+			if r.logger != nil {
+				r.logger.Log(context.Background(), LevelTrace, "create_command persist failed_entity",
+					"command_id", cmd.ID,
+					"device_id", deviceID,
+					"entity_id", entityID,
+					"persist_elapsed_ms", time.Since(persistStart).Milliseconds(),
+					"total_elapsed_ms", time.Since(cmdStart).Milliseconds())
+			}
+		}()
 		return types.CommandStatus{}, err
 	}
 
@@ -629,7 +738,19 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 		updated.Data.SyncStatus = types.SyncStatusPending
 	}
 	updated.Data.UpdatedAt = time.Now().UTC()
-	r.saveEntity(updated)
+	updatedCopy := updated
+	go func() {
+		persistStart := time.Now()
+		r.saveEntity(updatedCopy)
+		if r.logger != nil {
+			r.logger.Log(context.Background(), LevelTrace, "create_command persist ok",
+				"command_id", cmd.ID,
+				"device_id", deviceID,
+				"entity_id", entityID,
+				"persist_elapsed_ms", time.Since(persistStart).Milliseconds(),
+				"total_elapsed_ms", time.Since(cmdStart).Milliseconds())
+		}
+	}()
 	go r.dispatchLuaCommand(cmd)
 	return status, nil
 }
@@ -812,45 +933,7 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 	if err := json.Unmarshal(m.Data, &q); err != nil {
 		return
 	}
-	var matches []types.Device
-	qLower := strings.ToLower(q.Pattern)
-	for _, d := range r.loadDevices() {
-		if !matchesLabels(d.Labels, q.Labels) {
-			continue
-		}
-
-		if qLower != "" && qLower != "*" {
-			matched := false
-			if strings.Contains(strings.ToLower(d.ID), qLower) ||
-				strings.Contains(strings.ToLower(d.SourceID), qLower) ||
-				strings.Contains(strings.ToLower(d.SourceName), qLower) ||
-				strings.Contains(strings.ToLower(d.LocalName), qLower) {
-				matched = true
-			}
-			if !matched {
-				for _, vals := range d.Labels {
-					for _, v := range vals {
-						if strings.Contains(strings.ToLower(v), qLower) {
-							matched = true
-							break
-						}
-					}
-					if matched {
-						break
-					}
-				}
-			}
-			if !matched {
-				continue
-			}
-		} else if q.Pattern != "" {
-			if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
-				continue
-			}
-		}
-
-		matches = append(matches, d)
-	}
+	matches := r.searchDevicesLocal(q)
 	if matches == nil {
 		matches = []types.Device{}
 	}
@@ -873,45 +956,7 @@ func (r *Runner) handleEntitySearch(m *nats.Msg) {
 	if err := json.Unmarshal(m.Data, &q); err != nil {
 		return
 	}
-	var matches []types.Entity
-	qLower := strings.ToLower(q.Pattern)
-	for _, d := range r.loadDevices() {
-		for _, e := range r.loadEntities(d.ID) {
-			if !matchesLabels(e.Labels, q.Labels) {
-				continue
-			}
-
-			if qLower != "" && qLower != "*" {
-				matched := false
-				if strings.Contains(strings.ToLower(e.ID), qLower) ||
-					strings.Contains(strings.ToLower(e.LocalName), qLower) {
-					matched = true
-				}
-				if !matched {
-					for _, vals := range e.Labels {
-						for _, v := range vals {
-							if strings.Contains(strings.ToLower(v), qLower) {
-								matched = true
-								break
-							}
-						}
-						if matched {
-							break
-						}
-					}
-				}
-				if !matched {
-					continue
-				}
-			} else if q.Pattern != "" {
-				if ok, _ := filepath.Match(q.Pattern, e.ID); !ok {
-					continue
-				}
-			}
-
-			matches = append(matches, e)
-		}
-	}
+	matches := r.searchEntitiesLocal(q)
 	if matches == nil {
 		matches = []types.Entity{}
 	}
@@ -957,6 +1002,126 @@ func matchesLabels(have, want map[string][]string) bool {
 	return true
 }
 
+func (r *Runner) searchDevicesLocal(q types.SearchQuery) []types.Device {
+	var matches []types.Device
+	qLower := strings.ToLower(q.Pattern)
+	for _, d := range r.loadDevices() {
+		if q.PluginID != "" && q.PluginID != r.manifest.ID {
+			break
+		}
+		if q.DeviceID != "" && q.DeviceID != d.ID {
+			continue
+		}
+		if !matchesLabels(d.Labels, q.Labels) {
+			continue
+		}
+
+		if qLower != "" && qLower != "*" {
+			matched := false
+			if strings.Contains(strings.ToLower(d.ID), qLower) ||
+				strings.Contains(strings.ToLower(d.SourceID), qLower) ||
+				strings.Contains(strings.ToLower(d.SourceName), qLower) ||
+				strings.Contains(strings.ToLower(d.LocalName), qLower) {
+				matched = true
+			}
+			if !matched {
+				for _, vals := range d.Labels {
+					for _, v := range vals {
+						if strings.Contains(strings.ToLower(v), qLower) {
+							matched = true
+							break
+						}
+					}
+					if matched {
+						break
+					}
+				}
+			}
+			if !matched {
+				continue
+			}
+		} else if q.Pattern != "" {
+			if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
+				continue
+			}
+		}
+
+		matches = append(matches, d)
+	}
+	return applyDeviceLimit(matches, q.Limit)
+}
+
+func (r *Runner) searchEntitiesLocal(q types.SearchQuery) []types.Entity {
+	var matches []types.Entity
+	qLower := strings.ToLower(q.Pattern)
+	for _, d := range r.loadDevices() {
+		if q.PluginID != "" && q.PluginID != r.manifest.ID {
+			break
+		}
+		if q.DeviceID != "" && q.DeviceID != d.ID {
+			continue
+		}
+		for _, e := range r.loadEntities(d.ID) {
+			if q.EntityID != "" && q.EntityID != e.ID {
+				continue
+			}
+			if q.Domain != "" && q.Domain != e.Domain {
+				continue
+			}
+			if !matchesLabels(e.Labels, q.Labels) {
+				continue
+			}
+
+			if qLower != "" && qLower != "*" {
+				matched := false
+				if strings.Contains(strings.ToLower(e.ID), qLower) ||
+					strings.Contains(strings.ToLower(e.SourceID), qLower) ||
+					strings.Contains(strings.ToLower(e.SourceName), qLower) ||
+					strings.Contains(strings.ToLower(e.LocalName), qLower) {
+					matched = true
+				}
+				if !matched {
+					for _, vals := range e.Labels {
+						for _, v := range vals {
+							if strings.Contains(strings.ToLower(v), qLower) {
+								matched = true
+								break
+							}
+						}
+						if matched {
+							break
+						}
+					}
+				}
+				if !matched {
+					continue
+				}
+			} else if q.Pattern != "" {
+				if ok, _ := filepath.Match(q.Pattern, e.ID); !ok {
+					continue
+				}
+			}
+
+			matches = append(matches, e)
+		}
+	}
+	return applyEntityLimit(matches, q.Limit)
+}
+
+func applyDeviceLimit(items []types.Device, limit int) []types.Device {
+	if limit <= 0 || len(items) <= limit {
+		return items
+	}
+	return items[:limit]
+}
+
+func applyEntityLimit(items []types.Entity, limit int) []types.Entity {
+	if limit <= 0 || len(items) <= limit {
+		return items
+	}
+	return items[:limit]
+}
+
 func (r *Runner) snapshotRegistry() map[string]types.Registration {
 	r.registryMu.RLock()
 	defer r.registryMu.RUnlock()
@@ -975,20 +1140,67 @@ func (r *Runner) callRPC(pluginID, method string, params any, timeout time.Durat
 		return types.Response{}, fmt.Errorf("plugin not registered: %s", pluginID)
 	}
 
+	start := time.Now()
 	paramsBytes, _ := json.Marshal(params)
 	id := json.RawMessage(`1`)
 	req := types.Request{JSONRPC: types.JSONRPCVersion, ID: &id, Method: method, Params: paramsBytes}
 	data, _ := json.Marshal(req)
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "rpc request",
+			"plugin_id", pluginID,
+			"method", method,
+			"timeout_ms", timeout.Milliseconds(),
+			"start_unix_ms", start.UnixMilli())
+	}
 	msg, err := r.nc.Request(reg.RPCSubject, data, timeout)
 	if err != nil {
+		if r.logger != nil {
+			r.logger.Log(context.Background(), LevelTrace, "rpc request failed",
+				"plugin_id", pluginID,
+				"method", method,
+				"error", err.Error(),
+				"elapsed_ms", time.Since(start).Milliseconds())
+		}
 		return types.Response{}, err
 	}
 	var resp types.Response
 	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		if r.logger != nil {
+			r.logger.Log(context.Background(), LevelTrace, "rpc response unmarshal failed",
+				"plugin_id", pluginID,
+				"method", method,
+				"error", err.Error(),
+				"elapsed_ms", time.Since(start).Milliseconds())
+		}
 		return types.Response{}, err
 	}
 	if resp.Error != nil {
+		if r.logger != nil {
+			r.logger.Log(context.Background(), LevelTrace, "rpc response error",
+				"plugin_id", pluginID,
+				"method", method,
+				"error", resp.Error.Message,
+				"elapsed_ms", time.Since(start).Milliseconds())
+		}
 		return resp, fmt.Errorf("%s", resp.Error.Message)
+	}
+	if r.logger != nil {
+		fields := []any{
+			"plugin_id", pluginID,
+			"method", method,
+			"elapsed_ms", time.Since(start).Milliseconds(),
+		}
+		if method == "entities/commands/create" {
+			var status types.CommandStatus
+			if err := json.Unmarshal(resp.Result, &status); err == nil && strings.TrimSpace(status.CommandID) != "" {
+				fields = append(fields,
+					"command_id", status.CommandID,
+					"command_state", string(status.State),
+					"target_device_id", status.DeviceID,
+					"target_entity_id", status.EntityID)
+			}
+		}
+		r.logger.Log(context.Background(), LevelTrace, "rpc response ok", fields...)
 	}
 	return resp, nil
 }
@@ -1052,6 +1264,30 @@ func (r *Runner) refreshDevices() ([]types.Device, error) {
 	return merged, nil
 }
 
+func (r *Runner) bootstrapStartupTopology() error {
+	current := r.loadDevices()
+	discovered, err := r.plugin.OnDevicesList(current)
+	if err != nil {
+		return err
+	}
+	merged := ReconcileDevicesAdditive(current, discovered)
+	for _, dev := range merged {
+		if strings.TrimSpace(dev.ID) == "" {
+			continue
+		}
+		r.saveDevice(dev)
+	}
+	for _, dev := range merged {
+		if strings.TrimSpace(dev.ID) == "" {
+			continue
+		}
+		if _, err := r.refreshEntities(dev.ID); err != nil {
+			return fmt.Errorf("entities hydrate failed for device %s: %w", dev.ID, err)
+		}
+	}
+	return nil
+}
+
 func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
 	current := r.loadEntities(deviceID)
 	discovered, err := r.plugin.OnEntitiesList(deviceID, current)
@@ -1072,6 +1308,89 @@ func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
 		r.saveEntity(ent)
 	}
 	return merged, nil
+}
+
+func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
+	input := dev
+	if strings.TrimSpace(input.ID) == "" {
+		input.ID = strings.TrimSpace(input.SourceID)
+	}
+	if strings.TrimSpace(input.SourceID) == "" {
+		input.SourceID = input.ID
+	}
+	if input.LocalName == "" {
+		input.LocalName = input.Name()
+	}
+
+	created, err := r.plugin.OnDeviceCreate(input)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("devices/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.ID, "error", err.Error())
+		}
+		return input
+	}
+
+	if strings.TrimSpace(created.ID) == "" {
+		created.ID = input.ID
+	}
+	if strings.TrimSpace(created.SourceID) == "" {
+		created.SourceID = input.SourceID
+	}
+	if created.LocalName == "" {
+		created.LocalName = created.Name()
+	}
+	return created
+}
+
+func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
+	input := ent
+	if strings.TrimSpace(input.ID) == "" {
+		input.ID = strings.TrimSpace(input.SourceID)
+	}
+	if strings.TrimSpace(input.SourceID) == "" {
+		input.SourceID = input.ID
+	}
+	if input.LocalName == "" {
+		if input.SourceName != "" {
+			input.LocalName = input.SourceName
+		} else {
+			input.LocalName = input.ID
+		}
+	}
+	if input.Data.SyncStatus == types.SyncStatusEmpty {
+		input.Data.SyncStatus = types.SyncStatusSynced
+	}
+	if input.Data.UpdatedAt.IsZero() {
+		input.Data.UpdatedAt = time.Now().UTC()
+	}
+
+	created, err := r.plugin.OnEntityCreate(input)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("entities/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.DeviceID, "entity_id", input.ID, "error", err.Error())
+		}
+		return input
+	}
+
+	if strings.TrimSpace(created.ID) == "" {
+		created.ID = input.ID
+	}
+	if strings.TrimSpace(created.SourceID) == "" {
+		created.SourceID = input.SourceID
+	}
+	if strings.TrimSpace(created.DeviceID) == "" {
+		created.DeviceID = input.DeviceID
+	}
+	if created.LocalName == "" {
+		created.LocalName = input.LocalName
+	}
+	if created.Data.SyncStatus == types.SyncStatusEmpty {
+		created.Data.SyncStatus = input.Data.SyncStatus
+	}
+	if created.Data.UpdatedAt.IsZero() {
+		created.Data.UpdatedAt = input.Data.UpdatedAt
+	}
+	return created
 }
 
 func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcErr *types.RPCError) {
@@ -1102,77 +1421,42 @@ func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcE
 // --- File persistence ---
 
 func (r *Runner) saveDevice(dev types.Device) {
-	dir := filepath.Join(r.dataDir, "devices")
-	os.MkdirAll(dir, 0o755)
-	type DiskDevice types.Device
-	data, _ := json.MarshalIndent(DiskDevice(dev), "", "  ")
-	_ = r.writeIfChanged(filepath.Join(dir, dev.ID+".json"), data)
+	_ = r.ensureStateStore().SaveDevice(dev)
 }
 
 func (r *Runner) deleteDevice(id string) {
-	path := filepath.Join(r.dataDir, "devices", id+".json")
-	_ = os.Remove(path)
-	r.clearHash(path)
-	// Remove the entity directory for this device so no orphan files remain.
-	_ = os.RemoveAll(filepath.Join(r.dataDir, "devices", id))
+	_ = r.ensureStateStore().DeleteDevice(id)
 }
 
 func (r *Runner) deleteEntity(deviceID, entityID string) {
-	r.withDeviceLock(deviceID, func() {
-		path := filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json")
-		_ = os.Remove(path)
-		r.clearHash(path)
-	})
+	_ = r.ensureStateStore().DeleteEntity(deviceID, entityID)
 }
 
 func (r *Runner) loadDevices() []types.Device {
-	files, _ := filepath.Glob(filepath.Join(r.dataDir, "devices", "*.json"))
-	items := make([]types.Device, 0, len(files))
-	for _, f := range files {
-		data, _ := os.ReadFile(f)
-		r.seedHash(f, data)
-		var dev types.Device
-		json.Unmarshal(data, &dev)
-		items = append(items, dev)
+	items, err := r.ensureStateStore().LoadDevices()
+	if err != nil {
+		return nil
 	}
 	return items
 }
 
 func (r *Runner) loadDeviceByID(id string) types.Device {
-	path := filepath.Join(r.dataDir, "devices", id+".json")
-	data, err := os.ReadFile(path)
+	dev, err := r.ensureStateStore().LoadDeviceByID(id)
 	if err != nil {
 		return types.Device{}
 	}
-	r.seedHash(path, data)
-	var dev types.Device
-	json.Unmarshal(data, &dev)
 	return dev
 }
 
 func (r *Runner) saveEntity(ent types.Entity) {
-	// Ensure a device file exists before writing the entity so that
-	// loadDevices() can always discover the owning device.
-	deviceFile := filepath.Join(r.dataDir, "devices", ent.DeviceID+".json")
-	if _, err := os.Stat(deviceFile); os.IsNotExist(err) {
-		r.saveDevice(types.Device{ID: ent.DeviceID})
-	}
-	r.withDeviceLock(ent.DeviceID, func() {
-		dir := filepath.Join(r.dataDir, "devices", ent.DeviceID, "entities")
-		_ = os.MkdirAll(dir, 0o755)
-		data, _ := json.MarshalIndent(ent, "", "  ")
-		_ = r.writeIfChanged(filepath.Join(dir, ent.ID+".json"), data)
-	})
+	_ = r.ensureStateStore().SaveEntity(ent)
 }
 
 func (r *Runner) loadEntity(deviceID, entityID string) types.Entity {
-	var data []byte
-	r.withDeviceLock(deviceID, func() {
-		data, _ = os.ReadFile(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"))
-	})
-	r.seedHash(filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".json"), data)
-	var ent types.Entity
-	json.Unmarshal(data, &ent)
+	ent, err := r.ensureStateStore().LoadEntity(deviceID, entityID)
+	if err != nil {
+		return types.Entity{}
+	}
 	return ent
 }
 
@@ -1197,31 +1481,23 @@ func (r *Runner) resolveEntity(deviceID, entityID string) types.Entity {
 }
 
 func (r *Runner) loadEntities(deviceID string) []types.Entity {
-	items := make([]types.Entity, 0)
-	r.withDeviceLock(deviceID, func() {
-		files, _ := filepath.Glob(filepath.Join(r.dataDir, "devices", deviceID, "entities", "*.json"))
-		items = make([]types.Entity, 0, len(files))
-		for _, f := range files {
-			data, _ := os.ReadFile(f)
-			r.seedHash(f, data)
-			var ent types.Entity
-			json.Unmarshal(data, &ent)
-			items = append(items, ent)
-		}
-	})
+	items, err := r.ensureStateStore().LoadEntities(deviceID)
+	if err != nil {
+		return nil
+	}
 	return items
 }
 
 func (r *Runner) loadState(id string) types.Storage {
-	data, _ := os.ReadFile(filepath.Join(r.dataDir, id+".json"))
-	var store types.Storage
-	json.Unmarshal(data, &store)
+	store, err := r.ensureStateStore().LoadState(id)
+	if err != nil {
+		return types.Storage{}
+	}
 	return store
 }
 
 func (r *Runner) saveStateSynced(id string, store types.Storage) {
-	data, _ := json.MarshalIndent(store, "", "  ")
-	_ = r.writeIfChanged(filepath.Join(r.dataDir, id+".json"), data)
+	_ = r.ensureStateStore().SaveState(id, store)
 }
 
 func (r *Runner) deviceLock(deviceID string) *sync.Mutex {
@@ -1281,6 +1557,7 @@ func (r *Runner) seedHash(path string, data []byte) {
 }
 
 func (r *Runner) writeIfChanged(path string, data []byte) error {
+	start := time.Now()
 	newHash := hashBytes(data)
 	if oldHash, ok := r.getHash(path); ok && oldHash == newHash {
 		return nil
@@ -1311,10 +1588,16 @@ func (r *Runner) writeIfChanged(path string, data []byte) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
+	syncStart := time.Now()
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		return err
+	}
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "write_if_changed fsync",
+			"path", path,
+			"sync_elapsed_ms", time.Since(syncStart).Milliseconds())
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
@@ -1325,6 +1608,11 @@ func (r *Runner) writeIfChanged(path string, data []byte) error {
 		return err
 	}
 	r.setHash(path, newHash)
+	if r.logger != nil {
+		r.logger.Log(context.Background(), LevelTrace, "write_if_changed done",
+			"path", path,
+			"total_elapsed_ms", time.Since(start).Milliseconds())
+	}
 	return nil
 }
 

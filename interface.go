@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/slidebolt/sdk-types"
 )
@@ -22,6 +23,7 @@ type Config struct {
 	DataDir   string
 	EventSink EventSink
 	RawStore  RawStore
+	Logger    *slog.Logger
 }
 
 // EventSink allows plugin code to emit device-originated events back into

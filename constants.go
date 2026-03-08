@@ -4,6 +4,9 @@ package runner
 const (
 	EnvNATSURL    = "NATS_URL"
 	EnvPluginData = "PLUGIN_DATA_DIR"
+	// EnvStateSnapshotIntervalSec controls background snapshot cadence from in-memory canonical state to file snapshots.
+	// Default is 30 seconds.
+	EnvStateSnapshotIntervalSec = "STATE_SNAPSHOT_INTERVAL_SEC"
 )
 
 // Environment variable keys set by the launcher for the gateway.

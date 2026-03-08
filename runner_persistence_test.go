@@ -13,7 +13,7 @@ import (
 
 func newTestRunner(t *testing.T) *Runner {
 	t.Helper()
-	return &Runner{
+	r := &Runner{
 		dataDir:     t.TempDir(),
 		statuses:    make(map[string]types.CommandStatus),
 		registry:    make(map[string]types.Registration),
@@ -21,6 +21,8 @@ func newTestRunner(t *testing.T) *Runner {
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 	}
+	r.stateStore = newStateStore(r, "file")
+	return r
 }
 
 func TestWriteIfChangedSkipsIdenticalWrite(t *testing.T) {
@@ -93,9 +95,9 @@ func TestSaveEntityConcurrentNoCorruption(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
 				e := types.Entity{
-					ID:       entityID,
-					DeviceID: deviceID,
-					Domain:   "switch",
+					ID:        entityID,
+					DeviceID:  deviceID,
+					Domain:    "switch",
 					LocalName: "entity",
 					Data: types.EntityData{
 						SyncStatus: types.SyncStatusSynced,

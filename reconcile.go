@@ -8,6 +8,9 @@ import (
 // It merges a newly discovered device state into the existing persisted state,
 // enforcing strict field ownership rules.
 func ReconcileDevice(existing types.Device, discovered types.Device) types.Device {
+	if discovered.SourceID == "" {
+		discovered.SourceID = discovered.ID
+	}
 	// If it's a completely new device, just return it, but sanitize LocalName
 	if existing.ID == "" {
 		discovered.LocalName = "" // Hardware cannot set LocalName
@@ -56,6 +59,9 @@ func ReconcileDevices(existingMap map[string]types.Device, discovered []types.De
 
 // ReconcileEntity applies the same ownership wall as ReconcileDevice, but for entities.
 func ReconcileEntity(existing types.Entity, discovered types.Entity) types.Entity {
+	if discovered.SourceID == "" {
+		discovered.SourceID = discovered.ID
+	}
 	// New entity from discovery: sanitize user-owned fields.
 	if existing.ID == "" {
 		discovered.LocalName = ""
@@ -68,6 +74,8 @@ func ReconcileEntity(existing types.Entity, discovered types.Entity) types.Entit
 	result := existing
 
 	// Hardware/plugin-owned capabilities always win.
+	result.SourceID = discovered.SourceID
+	result.SourceName = discovered.SourceName
 	result.Domain = discovered.Domain
 	result.Actions = discovered.Actions
 
