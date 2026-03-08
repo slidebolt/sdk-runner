@@ -683,6 +683,72 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			}
 		}
 
+	case "entities/snapshots/save":
+		var params struct {
+			DeviceID string              `json:"device_id"`
+			EntityID string              `json:"entity_id"`
+			Name     string              `json:"name"`
+			Labels   map[string][]string `json:"labels,omitempty"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snap, err := r.SaveSnapshot(params.DeviceID, params.EntityID, params.Name, params.Labels)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snap
+		}
+
+	case "entities/snapshots/list":
+		var params struct {
+			DeviceID string `json:"device_id"`
+			EntityID string `json:"entity_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snaps, err := r.ListSnapshots(params.DeviceID, params.EntityID)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snaps
+		}
+
+	case "entities/snapshots/delete":
+		var params struct {
+			DeviceID   string `json:"device_id"`
+			EntityID   string `json:"entity_id"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		if err := r.DeleteSnapshot(params.DeviceID, params.EntityID, params.SnapshotID); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = true
+		}
+
+	case "entities/snapshots/restore":
+		var params struct {
+			DeviceID   string `json:"device_id"`
+			EntityID   string `json:"entity_id"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		if err := r.RestoreSnapshot(params.DeviceID, params.EntityID, params.SnapshotID); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = true
+		}
+
 	default:
 		rpcErr = &types.RPCError{Code: -32601, Message: "method not found"}
 	}
