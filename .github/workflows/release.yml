@@ -40,10 +40,18 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Update internal SDK dependencies
-        run: |
-          grep -E '^	' go.mod | grep 'github.com/slidebolt/sdk' | awk '{print $1"@latest"}' | xargs -r go get
-          go mod tidy
+            - name: Update internal SDK dependencies
+
+              env:
+
+                GOPROXY: direct
+
+              run: |
+
+                grep -E '^    ' go.mod | grep 'github.com/slidebolt/sdk' | awk '{print 
+      "@latest"}' | xargs -r go get
+
+                go mod tidy
 
 
       - name: Test
