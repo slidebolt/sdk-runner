@@ -39,11 +39,10 @@ func (r *Runner) ensureStateStore() stateStore {
 	r.lockMu.Lock()
 	defer r.lockMu.Unlock()
 	if r.stateStore == nil {
-		r.stateStore = newMemoryStateStore()
+		r.stateStore = newStateStore(r, "file")
 	}
 	return r.stateStore
 }
-
 type fileStateStore struct {
 	r *Runner
 }

@@ -64,12 +64,15 @@ func TestCreateDeviceWithFallback_WhenPluginRejects(t *testing.T) {
 	r := newTestRunner(t)
 	r.plugin = &createFallbackPlugin{deviceErr: errors.New("no synthetic")}
 
-	created := r.createDeviceWithFallback(types.Device{
+	created, err := r.createDeviceWithFallback(types.Device{
 		ID:        "dev-1",
 		SourceID:  "src-dev-1",
 		LocalName: "Device 1",
 	})
 
+	if err == nil {
+		t.Fatal("expected error when plugin rejects device create")
+	}
 	if created.ID != "dev-1" || created.SourceID != "src-dev-1" {
 		t.Fatalf("unexpected fallback device: %#v", created)
 	}
@@ -82,13 +85,16 @@ func TestCreateEntityWithFallback_WhenPluginRejects(t *testing.T) {
 	r := newTestRunner(t)
 	r.plugin = &createFallbackPlugin{entityErr: errors.New("no synthetic")}
 
-	created := r.createEntityWithFallback(types.Entity{
+	created, err := r.createEntityWithFallback(types.Entity{
 		ID:       "ent-1",
 		SourceID: "src-ent-1",
 		DeviceID: "dev-1",
 		Domain:   "switch",
 	})
 
+	if err == nil {
+		t.Fatal("expected error when plugin rejects entity create")
+	}
 	if created.ID != "ent-1" || created.SourceID != "src-ent-1" || created.DeviceID != "dev-1" {
 		t.Fatalf("unexpected fallback entity ids: %#v", created)
 	}

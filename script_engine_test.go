@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	types "github.com/slidebolt/sdk-types"
 	lua "github.com/yuin/gopher-lua"
 )
@@ -262,5 +263,79 @@ func TestEntityDataToMap_ExposesEffectivePower(t *testing.T) {
 	}
 	if _, ok := out["updated_at"]; !ok {
 		t.Fatalf("updated_at missing in map: %#v", out)
+	}
+}
+
+func TestCtxFind_EntityCollection(t *testing.T) {
+	// 1. Setup NATS and Mock Gateway Response
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = "nats://127.0.0.1:4222"
+	}
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Skip("NATS not available, skipping TestCtxFind_EntityCollection")
+	}
+	defer nc.Close()
+
+	// Mock the Gateway's NATS Discovery Bridge
+	sub, _ := nc.Subscribe(SubjectGatewayDiscovery, func(m *nats.Msg) {
+		if string(m.Data) != "?label=Location:Basement" {
+			return
+		}
+		resp := []map[string]any{
+			{
+				"plugin_id": "plugin-test",
+				"device_id": "d1",
+				"id":        "e1",
+				"domain":    "light",
+			},
+		}
+		data, _ := json.Marshal(resp)
+		m.Respond(data)
+	})
+	defer sub.Unsubscribe()
+
+	r := newScriptTestRunner(t)
+	r.nc = nc
+	r.manifest.ID = "plugin-test"
+
+	deviceID := "listener-device"
+	entityID := "listener-entity"
+	script := `
+function OnInit(Ctx)
+  local lights = Ctx:Find("?label=Location:Basement")
+  Ctx:SetState("found_count", lights:Count())
+  lights:OnEvent("state", "HandleState")
+end
+
+function HandleState(Ctx, Event)
+  Ctx:SetState("handled", true)
+end
+`
+	if _, err := r.putScriptSource(deviceID, entityID, script); err != nil {
+		t.Fatalf("put script failed: %v", err)
+	}
+	statePath := filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".state.lua.json")
+
+	// 2. Initial run triggers the Find call over NATS
+	_, _ = r.ensureScriptRuntime(deviceID, entityID)
+	state := mustReadState(t, statePath)
+	if count, _ := state["found_count"].(float64); int(count) != 1 {
+		t.Fatalf("found_count=%v want=1 (state=%v)", count, state)
+	}
+
+	// 3. Dispatch event and check handler
+	payload, _ := json.Marshal(map[string]any{"type": "state", "on": true})
+	r.dispatchLuaEvent(types.EntityEventEnvelope{
+		PluginID: "plugin-test",
+		DeviceID: "d1",
+		EntityID: "e1",
+		Payload:  payload,
+	})
+
+	state = mustReadState(t, statePath)
+	if state["handled"] == nil || !state["handled"].(bool) {
+		t.Fatalf("handler not called after NATS-based registration (state=%v)", state)
 	}
 }

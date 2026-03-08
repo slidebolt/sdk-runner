@@ -137,10 +137,13 @@ func (r *Runner) dispatchLuaCommand(cmd types.Command) {
 func (r *Runner) dispatchLuaEvent(env types.EntityEventEnvelope) {
 	r.ensureKnownScriptRuntimes()
 
-	eventType := eventType(env.Payload)
-	selectors := eventSelectors(env, eventType)
-
-	r.scriptsMu.Lock()
+		eventType := eventType(env.Payload)
+		selectors := eventSelectors(env, eventType)
+	
+		if r.logger != nil {
+		r.logger.Info("dispatching Lua event", "plugin", env.PluginID, "device", env.DeviceID, "entity", env.EntityID, "type", eventType, "selectors", selectors)
+	}
+		r.scriptsMu.Lock()
 	snapshot := make([]*scriptRuntime, 0, len(r.scripts))
 	for _, rt := range r.scripts {
 		snapshot = append(snapshot, rt)
@@ -158,12 +161,14 @@ func (r *Runner) dispatchLuaEvent(env types.EntityEventEnvelope) {
 			if !ok || handler == "" {
 				continue
 			}
+			if r.logger != nil {
+				r.logger.Info("Lua event match found", "selector", selector, "handler", handler, "script", rt.key.EntityID)
+			}
 			r.callLuaHandler(rt, handler, luaEventFromEnvelope(env, eventType))
 		}
 		rt.mu.Unlock()
 	}
 }
-
 func (r *Runner) ensureKnownScriptRuntimes() {
 	paths, _ := filepath.Glob(filepath.Join(r.dataDir, "devices", "*", "entities", "*.lua"))
 	for _, path := range paths {
@@ -503,8 +508,144 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 			L.Push(lua.LNil)
 			return 2
 		},
+		"Find": func(L *lua.LState) int {
+			queryStr := strings.TrimSpace(L.CheckString(2))
+			if queryStr == "" {
+				queryStr = "?q=*"
+			}
+
+			if r.nc == nil {
+				if r.logger != nil {
+					r.logger.Error("Ctx:Find failed: NATS connection unavailable")
+				}
+				L.Push(r.newEntityCollection(L, rt, nil))
+				return 1
+			}
+
+			if r.logger != nil {
+				r.logger.Info("Ctx:Find dispatching NATS request", "subject", SubjectGatewayDiscovery, "query", queryStr)
+			}
+			msg, err := r.nc.Request(SubjectGatewayDiscovery, []byte(queryStr), 5*time.Second)
+			if err != nil {
+				if r.logger != nil {
+					r.logger.Error("Ctx:Find failed", "query", queryStr, "error", err)
+				}
+				L.Push(r.newEntityCollection(L, rt, nil))
+				return 1
+			}
+			if r.logger != nil {
+				r.logger.Info("Ctx:Find received NATS response", "bytes", len(msg.Data))
+			}
+
+			var matches []struct {
+				PluginID string `json:"plugin_id"`
+				DeviceID string `json:"device_id"`
+				ID       string `json:"id"`
+				Domain   string `json:"domain"`
+			}
+			if err := json.Unmarshal(msg.Data, &matches); err != nil {
+				if r.logger != nil {
+					r.logger.Error("Ctx:Find decode failed", "error", err)
+				}
+				L.Push(r.newEntityCollection(L, rt, nil))
+				return 1
+			}
+
+			found := make([]foundEntity, len(matches))
+			for i, m := range matches {
+				found[i] = foundEntity{
+					PluginID: m.PluginID,
+					DeviceID: m.DeviceID,
+					EntityID: m.ID,
+					Domain:   m.Domain,
+				}
+			}
+
+			L.Push(r.newEntityCollection(L, rt, found))
+			return 1
+		},
 	})
 	rt.L.SetGlobal("Ctx", ctx)
+}
+
+func (r *Runner) newEntityCollection(L *lua.LState, rt *scriptRuntime, entities []foundEntity) *lua.LTable {
+	t := L.NewTable()
+	// Expose raw list for iteration if needed
+	list := L.NewTable()
+	for _, ent := range entities {
+		list.Append(mapToLTable(L, map[string]any{
+			"PluginID": ent.PluginID,
+			"DeviceID": ent.DeviceID,
+			"EntityID": ent.EntityID,
+			"Domain":   ent.Domain,
+		}))
+	}
+	t.RawSetString("Entities", list)
+
+	// Add bulk methods
+	L.SetFuncs(t, map[string]lua.LGFunction{
+		"OnEvent": func(L *lua.LState) int {
+			eventType := strings.TrimSpace(L.CheckString(2))
+			handler := strings.TrimSpace(L.CheckString(3))
+			if eventType == "" || handler == "" {
+				return 0
+			}
+			if r.logger != nil {
+				r.logger.Info("Collection:OnEvent bulk registering", "count", len(entities), "type", eventType, "handler", handler)
+			}
+			for _, ent := range entities {
+				selector := fmt.Sprintf("%s.%s.%s.%s", ent.PluginID, ent.DeviceID, ent.EntityID, eventType)
+				if r.logger != nil {
+					r.logger.Info("Collection:OnEvent registering selector", "selector", selector)
+				}
+				rt.eventSubs[selector] = handler
+			}
+			return 0
+		},
+		"SendCommand": func(L *lua.LState) int {
+			payload := lValueToAny(L.CheckAny(2))
+			body, _ := json.Marshal(payload)
+			results := L.NewTable()
+			for _, ent := range entities {
+				status, err := r.callCreateCommand(ent.PluginID, ent.DeviceID, ent.EntityID, body)
+				res := map[string]any{
+					"PluginID": ent.PluginID,
+					"DeviceID": ent.DeviceID,
+					"EntityID": ent.EntityID,
+				}
+				if err != nil {
+					res["OK"] = false
+					res["Error"] = err.Error()
+				} else {
+					res["OK"] = true
+					res["CommandID"] = status.CommandID
+				}
+				results.Append(mapToLTable(L, res))
+			}
+			L.Push(results)
+			return 1
+		},
+		"EmitEvent": func(L *lua.LState) int {
+			payload := lValueToAny(L.CheckAny(2))
+			rawPayload, _ := json.Marshal(payload)
+			correlationID := L.OptString(3, "")
+			for _, ent := range entities {
+				_ = r.EmitEvent(types.InboundEvent{
+					DeviceID:      ent.DeviceID,
+					EntityID:      ent.EntityID,
+					CorrelationID: correlationID,
+					Payload:       rawPayload,
+				})
+			}
+			return 0
+		},
+		"Count": func(L *lua.LState) int {
+			L.Push(lua.LNumber(len(entities)))
+			return 1
+		},
+	})
+
+	return t
 }
 
 type foundDevice struct {
@@ -526,7 +667,6 @@ type foundEntity struct {
 	LocalName  string
 	Labels     map[string][]string
 }
-
 func (r *Runner) findDevices(query scriptQuery) []foundDevice {
 	pattern := strings.TrimSpace(query.Pattern)
 	if pattern == "" {

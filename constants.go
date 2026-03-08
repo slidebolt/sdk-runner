@@ -33,4 +33,5 @@ const (
 	SubjectSearchPlugins  = "slidebolt.search.plugins"
 	SubjectEntityEvents   = "slidebolt.entity.events"
 	SubjectCommandStatus  = "slidebolt.command.status"
+	SubjectGatewayDiscovery = "slidebolt.gateway.discovery"
 )

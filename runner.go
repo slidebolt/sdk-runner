@@ -70,9 +70,8 @@ func NewRunner(p Plugin) (*Runner, error) {
 	logger, levelVar := newLogger(defaultLogServiceName())
 	r := &Runner{
 		plugin:      p,
-		dataDir:     dataDir,
-		statuses:    make(map[string]types.CommandStatus),
-		registry:    make(map[string]types.Registration),
+						dataDir:    dataDir,
+						statuses:   make(map[string]types.CommandStatus),		registry:    make(map[string]types.Registration),
 		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
@@ -123,8 +122,28 @@ func (r *Runner) Run() error {
 	if err != nil {
 		return err
 	}
+	var regData []byte
 	for i := 0; i < 5; i++ {
-		r.nc, err = nats.Connect(url)
+		r.nc, err = nats.Connect(url,
+			nats.RetryOnFailedConnect(true),
+			nats.MaxReconnects(-1),
+			nats.ReconnectWait(200*time.Millisecond),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, derr error) {
+				if r.logger != nil {
+					r.logger.Warn("nats disconnected", "error", derr)
+				}
+			}),
+			nats.ReconnectHandler(func(c *nats.Conn) {
+				if r.logger != nil {
+					r.logger.Info("nats reconnected", "url", c.ConnectedUrl())
+				}
+				// Push a fresh registration immediately after reconnect so the
+				// gateway can restore registry/search routing quickly.
+				if len(regData) > 0 {
+					_ = c.Publish(SubjectRegistration, regData)
+				}
+			}),
+		)
 		if err == nil {
 			break
 		}
@@ -160,7 +179,7 @@ func (r *Runner) Run() error {
 	}()
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
-	regData, err := json.Marshal(reg)
+	regData, err = json.Marshal(reg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal registration: %w", err)
 	}
@@ -180,10 +199,26 @@ func (r *Runner) Run() error {
 	r.nc.Subscribe(SubjectDiscoveryProbe, func(m *nats.Msg) {
 		r.nc.Publish(SubjectRegistration, regData)
 	})
+	// Registration heartbeat: keeps gateway registry converged even if
+	// reconnect/probe messages are missed during turbulence.
+	regStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-regStop:
+				return
+			case <-t.C:
+				_ = r.nc.Publish(SubjectRegistration, regData)
+			}
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+	close(regStop)
 	r.plugin.OnShutdown()
 	_ = r.nc.Drain()
 	return nil
@@ -281,9 +316,13 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created := r.createDeviceWithFallback(dev)
-		r.saveDevice(created)
-		result = created
+		created, err := r.createDeviceWithFallback(dev)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.saveDevice(created)
+			result = created
+		}
 
 	case "devices/update":
 		var incoming types.Device
@@ -361,9 +400,19 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created := r.createEntityWithFallback(ent)
-		r.saveEntity(created)
-		result = created
+		created, err := r.createEntityWithFallback(ent)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.saveEntity(created)
+			// Also persist the owning device so it is visible on restart.
+			if dev := r.loadDeviceByID(created.DeviceID); dev.ID != "" {
+				r.saveDevice(dev)
+			} else if created.DeviceID != "" {
+				r.saveDevice(types.Device{ID: created.DeviceID, SourceID: created.DeviceID, LocalName: created.DeviceID})
+			}
+			result = created
+		}
 
 	case "entities/update":
 		var incoming types.Entity
@@ -783,7 +832,15 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	}
 	updated, err := r.plugin.OnEvent(event, ent)
 	if err != nil {
-		return types.Entity{}, err
+		// Plugin couldn't process the event (e.g. unsupported domain), but the
+		// event was received. Apply the raw payload so state is up to date.
+		if r.logger != nil {
+			r.logger.Warn("plugin OnEvent error; applying raw payload", "plugin", r.manifest.ID, "device", evt.DeviceID, "entity", evt.EntityID, "error", err.Error())
+		}
+		updated = ent
+		updated.Data.Reported = evt.Payload
+		updated.Data.Effective = evt.Payload
+		updated.Data.SyncStatus = types.SyncStatusSynced
 	}
 	updated.Data.LastEventID = event.ID
 	if event.CorrelationID != "" {
@@ -1310,7 +1367,7 @@ func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
 	return merged, nil
 }
 
-func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
+func (r *Runner) createDeviceWithFallback(dev types.Device) (types.Device, error) {
 	input := dev
 	if strings.TrimSpace(input.ID) == "" {
 		input.ID = strings.TrimSpace(input.SourceID)
@@ -1327,7 +1384,7 @@ func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
 		if r.logger != nil {
 			r.logger.Warn("devices/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.ID, "error", err.Error())
 		}
-		return input
+		return input, err
 	}
 
 	if strings.TrimSpace(created.ID) == "" {
@@ -1339,10 +1396,10 @@ func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
 	if created.LocalName == "" {
 		created.LocalName = created.Name()
 	}
-	return created
+	return created, nil
 }
 
-func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
+func (r *Runner) createEntityWithFallback(ent types.Entity) (types.Entity, error) {
 	input := ent
 	if strings.TrimSpace(input.ID) == "" {
 		input.ID = strings.TrimSpace(input.SourceID)
@@ -1369,7 +1426,7 @@ func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
 		if r.logger != nil {
 			r.logger.Warn("entities/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.DeviceID, "entity_id", input.ID, "error", err.Error())
 		}
-		return input
+		return input, err
 	}
 
 	if strings.TrimSpace(created.ID) == "" {
@@ -1390,7 +1447,7 @@ func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
 	if created.Data.UpdatedAt.IsZero() {
 		created.Data.UpdatedAt = input.Data.UpdatedAt
 	}
-	return created
+	return created, nil
 }
 
 func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcErr *types.RPCError) {
@@ -1422,14 +1479,23 @@ func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcE
 
 func (r *Runner) saveDevice(dev types.Device) {
 	_ = r.ensureStateStore().SaveDevice(dev)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.SaveDevice(dev)
+	}
 }
 
 func (r *Runner) deleteDevice(id string) {
 	_ = r.ensureStateStore().DeleteDevice(id)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.DeleteDevice(id)
+	}
 }
 
 func (r *Runner) deleteEntity(deviceID, entityID string) {
 	_ = r.ensureStateStore().DeleteEntity(deviceID, entityID)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.DeleteEntity(deviceID, entityID)
+	}
 }
 
 func (r *Runner) loadDevices() []types.Device {
@@ -1450,6 +1516,9 @@ func (r *Runner) loadDeviceByID(id string) types.Device {
 
 func (r *Runner) saveEntity(ent types.Entity) {
 	_ = r.ensureStateStore().SaveEntity(ent)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.SaveEntity(ent)
+	}
 }
 
 func (r *Runner) loadEntity(deviceID, entityID string) types.Entity {
