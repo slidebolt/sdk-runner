@@ -81,14 +81,14 @@ function OnEventBase(Ctx, EventRef)
   Ctx:SetState("base_count", (Ctx:GetState("base_count") or 0) + 1)
 end
 `
-	if _, err := r.putScriptSource(deviceID, entityID, script); err != nil {
+	if _, err := r.ScriptPut(deviceID, entityID, script); err != nil {
 		t.Fatalf("put script failed: %v", err)
 	}
 	statePath := filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".state.lua.json")
 	_ = os.Remove(statePath)
 
 	payload, _ := json.Marshal(map[string]any{"state": true})
-	r.dispatchLuaEvent(types.EntityEventEnvelope{
+	r.handleEvent(types.EntityEventEnvelope{
 		EventID:    "evt-1",
 		PluginID:   "plugin-esphome",
 		DeviceID:   "switch_basement_edison",
@@ -119,14 +119,14 @@ function OnDoorbell(Ctx, EventRef)
   Ctx:SetState("typed_count", (Ctx:GetState("typed_count") or 0) + 1)
 end
 `
-	if _, err := r.putScriptSource(deviceID, entityID, script); err != nil {
+	if _, err := r.ScriptPut(deviceID, entityID, script); err != nil {
 		t.Fatalf("put script failed: %v", err)
 	}
 	statePath := filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".state.lua.json")
 	_ = os.Remove(statePath)
 
 	payload, _ := json.Marshal(map[string]any{"state": true})
-	r.dispatchLuaEvent(types.EntityEventEnvelope{
+	r.handleEvent(types.EntityEventEnvelope{
 		EventID:    "evt-2",
 		PluginID:   "plugin-esphome",
 		DeviceID:   "switch_basement_edison",
@@ -313,7 +313,7 @@ function HandleState(Ctx, Event)
   Ctx:SetState("handled", true)
 end
 `
-	if _, err := r.putScriptSource(deviceID, entityID, script); err != nil {
+	if _, err := r.ScriptPut(deviceID, entityID, script); err != nil {
 		t.Fatalf("put script failed: %v", err)
 	}
 	statePath := filepath.Join(r.dataDir, "devices", deviceID, "entities", entityID+".state.lua.json")
@@ -327,7 +327,7 @@ end
 
 	// 3. Dispatch event and check handler
 	payload, _ := json.Marshal(map[string]any{"type": "state", "on": true})
-	r.dispatchLuaEvent(types.EntityEventEnvelope{
+	r.handleEvent(types.EntityEventEnvelope{
 		PluginID: "plugin-test",
 		DeviceID: "d1",
 		EntityID: "e1",

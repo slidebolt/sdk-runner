@@ -111,8 +111,8 @@ func (r *Runner) loadScriptRuntime(key scriptKey, path string, mtimeUnix int64) 
 	return rt, nil
 }
 
-func (r *Runner) dispatchLuaCommand(cmd types.Command) {
-	action := commandAction(cmd.Payload)
+func (r *Runner) handleCommand(cmd types.Command) {
+	action := payloadType(cmd.Payload)
 	selectors := commandSelectors(cmd, action)
 
 	rt, err := r.ensureScriptRuntime(cmd.DeviceID, cmd.EntityID)
@@ -134,10 +134,10 @@ func (r *Runner) dispatchLuaCommand(cmd types.Command) {
 	}
 }
 
-func (r *Runner) dispatchLuaEvent(env types.EntityEventEnvelope) {
+func (r *Runner) handleEvent(env types.EntityEventEnvelope) {
 	r.ensureKnownScriptRuntimes()
 
-		eventType := eventType(env.Payload)
+		eventType := payloadType(env.Payload)
 		selectors := eventSelectors(env, eventType)
 	
 		if r.logger != nil {
@@ -192,7 +192,9 @@ func (r *Runner) callLuaHandler(rt *scriptRuntime, handler string, payload map[s
 		NRet:    0,
 		Protect: true,
 	}, rt.L.GetGlobal("Ctx"), arg); err != nil {
-		fmt.Printf("[lua][handler-error][%s/%s] %s: %v\n", rt.key.DeviceID, rt.key.EntityID, handler, err)
+		if r.logger != nil {
+			r.logger.Error("lua handler error", "device", rt.key.DeviceID, "entity", rt.key.EntityID, "handler", handler, "error", err)
+		}
 	}
 }
 
@@ -421,29 +423,29 @@ func (rt *scriptRuntime) installCtx(r *Runner) {
 		},
 		"LogInfo": func(L *lua.LState) int {
 			msg := L.OptString(2, "")
-			if msg != "" {
-				fmt.Printf("[lua][%s/%s] %s\n", rt.key.DeviceID, rt.key.EntityID, msg)
+			if msg != "" && r.logger != nil {
+				r.logger.Info(msg, "device", rt.key.DeviceID, "entity", rt.key.EntityID)
 			}
 			return 0
 		},
 		"LogDebug": func(L *lua.LState) int {
 			msg := L.OptString(2, "")
-			if msg != "" {
-				fmt.Printf("[lua][debug][%s/%s] %s\n", rt.key.DeviceID, rt.key.EntityID, msg)
+			if msg != "" && r.logger != nil {
+				r.logger.Debug(msg, "device", rt.key.DeviceID, "entity", rt.key.EntityID)
 			}
 			return 0
 		},
 		"LogWarn": func(L *lua.LState) int {
 			msg := L.OptString(2, "")
-			if msg != "" {
-				fmt.Printf("[lua][warn][%s/%s] %s\n", rt.key.DeviceID, rt.key.EntityID, msg)
+			if msg != "" && r.logger != nil {
+				r.logger.Warn(msg, "device", rt.key.DeviceID, "entity", rt.key.EntityID)
 			}
 			return 0
 		},
 		"LogError": func(L *lua.LState) int {
 			msg := L.OptString(2, "")
-			if msg != "" {
-				fmt.Printf("[lua][error][%s/%s] %s\n", rt.key.DeviceID, rt.key.EntityID, msg)
+			if msg != "" && r.logger != nil {
+				r.logger.Error(msg, "device", rt.key.DeviceID, "entity", rt.key.EntityID)
 			}
 			return 0
 		},
@@ -1185,7 +1187,7 @@ func (r *Runner) invalidateScriptRuntime(deviceID, entityID string) {
 	}
 }
 
-func (r *Runner) getScriptSource(deviceID, entityID string) (string, string, error) {
+func (r *Runner) ScriptGet(deviceID, entityID string) (string, string, error) {
 	path := r.scriptPath(deviceID, entityID)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1194,7 +1196,7 @@ func (r *Runner) getScriptSource(deviceID, entityID string) (string, string, err
 	return string(data), path, nil
 }
 
-func (r *Runner) putScriptSource(deviceID, entityID, source string) (string, error) {
+func (r *Runner) ScriptPut(deviceID, entityID, source string) (string, error) {
 	path := r.scriptPath(deviceID, entityID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return path, err
@@ -1206,7 +1208,7 @@ func (r *Runner) putScriptSource(deviceID, entityID, source string) (string, err
 	return path, nil
 }
 
-func (r *Runner) deleteScriptSource(deviceID, entityID string, purgeState bool) error {
+func (r *Runner) ScriptDelete(deviceID, entityID string, purgeState bool) error {
 	path := r.scriptPath(deviceID, entityID)
 	_ = os.Remove(path)
 	r.invalidateScriptRuntime(deviceID, entityID)
@@ -1216,12 +1218,12 @@ func (r *Runner) deleteScriptSource(deviceID, entityID string, purgeState bool) 
 	return nil
 }
 
-func (r *Runner) getScriptState(deviceID, entityID string) (map[string]any, string) {
+func (r *Runner) ScriptStateGet(deviceID, entityID string) (map[string]any, string) {
 	path := r.scriptStatePath(deviceID, entityID)
 	return r.loadScriptState(deviceID, entityID), path
 }
 
-func (r *Runner) putScriptState(deviceID, entityID string, state map[string]any) (string, error) {
+func (r *Runner) ScriptStatePut(deviceID, entityID string, state map[string]any) (string, error) {
 	if state == nil {
 		state = map[string]any{}
 	}
@@ -1230,7 +1232,7 @@ func (r *Runner) putScriptState(deviceID, entityID string, state map[string]any)
 	return path, nil
 }
 
-func (r *Runner) deleteScriptState(deviceID, entityID string) (string, error) {
+func (r *Runner) ScriptStateDelete(deviceID, entityID string) (string, error) {
 	path := r.scriptStatePath(deviceID, entityID)
 	_ = os.Remove(path)
 	return path, nil
@@ -1313,15 +1315,7 @@ func lValueToAny(v lua.LValue) any {
 	}
 }
 
-func commandAction(payload json.RawMessage) string {
-	var probe struct {
-		Type string `json:"type"`
-	}
-	_ = json.Unmarshal(payload, &probe)
-	return strings.TrimSpace(probe.Type)
-}
-
-func eventType(payload json.RawMessage) string {
+func payloadType(payload json.RawMessage) string {
 	var probe struct {
 		Type string `json:"type"`
 	}

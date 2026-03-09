@@ -31,9 +31,9 @@ func newSnapshotID() string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// SaveSnapshot captures the current Effective state of an entity as a named
+// CreateSnapshot captures the current Effective state of an entity as a named
 // snapshot. Returns the created EntitySnapshot with its assigned UUID.
-func (r *Runner) SaveSnapshot(deviceID, entityID, name string, labels map[string][]string) (types.EntitySnapshot, error) {
+func (r *Runner) CreateSnapshot(deviceID, entityID, name string, labels map[string][]string) (types.EntitySnapshot, error) {
 	ent := r.loadEntity(deviceID, entityID)
 	if ent.ID == "" {
 		return types.EntitySnapshot{}, fmt.Errorf("entity not found: %s/%s", deviceID, entityID)

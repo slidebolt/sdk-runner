@@ -145,7 +145,7 @@ func ReconcileEntitiesAdditive(existing []types.Entity, discovered []types.Entit
 }
 
 // EnsureCoreDevice guarantees that the plugin's management device (ID = pluginID) is present
-// in the device list. Call this at the end of OnDevicesList.
+// in the device list. Call this at the end of OnDeviceDiscover.
 func EnsureCoreDevice(pluginID string, current []types.Device) []types.Device {
 	coreID := types.CoreDeviceID(pluginID)
 	for _, d := range current {
@@ -161,7 +161,7 @@ func EnsureCoreDevice(pluginID string, current []types.Device) []types.Device {
 }
 
 // EnsureCoreEntities guarantees that the core health entity is present for the plugin's
-// management device. Call this at the start of OnEntitiesList for every deviceID.
+// management device. Call this at the start of OnEntityDiscover for every deviceID.
 func EnsureCoreEntities(pluginID, deviceID string, current []types.Entity) []types.Entity {
 	if deviceID != types.CoreDeviceID(pluginID) {
 		return current

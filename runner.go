@@ -85,7 +85,7 @@ func NewRunner(p Plugin) (*Runner, error) {
 	return r, nil
 }
 
-func (r *Runner) GetLogLevel() string {
+func (r *Runner) LogLevel() string {
 	if r == nil || r.logLevel == nil {
 		return "info"
 	}
@@ -236,7 +236,7 @@ func (r *Runner) runDiscoveryMode() error {
 	}
 	waitCancel()
 
-	devices, err := r.plugin.OnDevicesList(nil)
+	devices, err := r.plugin.OnDeviceDiscover(nil)
 	if err != nil {
 		return fmt.Errorf("discovery failed: %w", err)
 	}
@@ -273,7 +273,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "logging/get_level":
 		result = map[string]any{
-			"level": r.GetLogLevel(),
+			"level": r.LogLevel(),
 		}
 
 	case "logging/set_level":
@@ -302,7 +302,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "storage/update":
 		current := r.loadState("default")
-		updated, err := r.plugin.OnStorageUpdate(current)
+		updated, err := r.plugin.OnConfigUpdate(current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -372,7 +372,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "devices/list":
 		current := r.loadDevices()
-		discovered, err := r.plugin.OnDevicesList(current)
+		discovered, err := r.plugin.OnDeviceDiscover(current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -472,7 +472,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			break
 		}
 		current := r.loadEntities(params.DeviceID)
-		discovered, err := r.plugin.OnEntitiesList(params.DeviceID, current)
+		discovered, err := r.plugin.OnEntityDiscover(params.DeviceID, current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -561,7 +561,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		source, path, err := r.getScriptSource(params.DeviceID, params.EntityID)
+		source, path, err := r.ScriptGet(params.DeviceID, params.EntityID)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32004, Message: err.Error()}
 		} else {
@@ -584,7 +584,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		path, err := r.putScriptSource(params.DeviceID, params.EntityID, params.Source)
+		path, err := r.ScriptPut(params.DeviceID, params.EntityID, params.Source)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -607,7 +607,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		err := r.deleteScriptSource(params.DeviceID, params.EntityID, params.PurgeState)
+		err := r.ScriptDelete(params.DeviceID, params.EntityID, params.PurgeState)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -629,7 +629,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		state, path := r.getScriptState(params.DeviceID, params.EntityID)
+		state, path := r.ScriptStateGet(params.DeviceID, params.EntityID)
 		result = map[string]any{
 			"plugin_id": r.manifest.ID,
 			"device_id": params.DeviceID,
@@ -648,7 +648,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		path, err := r.putScriptState(params.DeviceID, params.EntityID, params.State)
+		path, err := r.ScriptStatePut(params.DeviceID, params.EntityID, params.State)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -670,7 +670,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		path, err := r.deleteScriptState(params.DeviceID, params.EntityID)
+		path, err := r.ScriptStateDelete(params.DeviceID, params.EntityID)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -694,7 +694,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		snap, err := r.SaveSnapshot(params.DeviceID, params.EntityID, params.Name, params.Labels)
+		snap, err := r.CreateSnapshot(params.DeviceID, params.EntityID, params.Name, params.Labels)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -866,7 +866,7 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 				"total_elapsed_ms", time.Since(cmdStart).Milliseconds())
 		}
 	}()
-	go r.dispatchLuaCommand(cmd)
+	go r.handleCommand(cmd)
 	return status, nil
 }
 
@@ -945,7 +945,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 			log.Printf("plugin-runner: failed to publish entity event: %v", err)
 		}
 	}
-	go r.dispatchLuaEvent(envelope)
+	go r.handleEvent(envelope)
 
 	return updated, nil
 }
@@ -990,7 +990,7 @@ func (r *Runner) handleEntityEvent(m *nats.Msg) {
 	if env.PluginID == r.manifest.ID {
 		return
 	}
-	r.dispatchLuaEvent(env)
+	r.handleEvent(env)
 }
 
 func (r *Runner) getCommandStatus(id string) (types.CommandStatus, bool) {
@@ -1370,7 +1370,7 @@ func (r *Runner) callCreateCommand(pluginID, deviceID, entityID string, payload 
 
 func (r *Runner) refreshDevices() ([]types.Device, error) {
 	current := r.loadDevices()
-	discovered, err := r.plugin.OnDevicesList(current)
+	discovered, err := r.plugin.OnDeviceDiscover(current)
 	if err != nil {
 		return nil, err
 	}
@@ -1389,7 +1389,7 @@ func (r *Runner) refreshDevices() ([]types.Device, error) {
 
 func (r *Runner) bootstrapStartupTopology() error {
 	current := r.loadDevices()
-	discovered, err := r.plugin.OnDevicesList(current)
+	discovered, err := r.plugin.OnDeviceDiscover(current)
 	if err != nil {
 		return err
 	}
@@ -1413,7 +1413,7 @@ func (r *Runner) bootstrapStartupTopology() error {
 
 func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
 	current := r.loadEntities(deviceID)
-	discovered, err := r.plugin.OnEntitiesList(deviceID, current)
+	discovered, err := r.plugin.OnEntityDiscover(deviceID, current)
 	if err != nil {
 		return nil, err
 	}
@@ -1599,7 +1599,7 @@ func (r *Runner) resolveEntity(deviceID, entityID string) types.Entity {
 	if ent := r.loadEntity(deviceID, entityID); ent.ID != "" {
 		return ent
 	}
-	list, err := r.plugin.OnEntitiesList(deviceID, r.loadEntities(deviceID))
+	list, err := r.plugin.OnEntityDiscover(deviceID, r.loadEntities(deviceID))
 	if err != nil {
 		return types.Entity{}
 	}

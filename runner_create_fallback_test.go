@@ -21,7 +21,7 @@ func (p *createFallbackPlugin) OnReady()                            {}
 func (p *createFallbackPlugin) WaitReady(ctx context.Context) error { return nil }
 func (p *createFallbackPlugin) OnShutdown()                         {}
 func (p *createFallbackPlugin) OnHealthCheck() (string, error)      { return "ok", nil }
-func (p *createFallbackPlugin) OnStorageUpdate(current types.Storage) (types.Storage, error) {
+func (p *createFallbackPlugin) OnConfigUpdate(current types.Storage) (types.Storage, error) {
 	return current, nil
 }
 func (p *createFallbackPlugin) OnDeviceCreate(device types.Device) (types.Device, error) {
@@ -34,7 +34,7 @@ func (p *createFallbackPlugin) OnDeviceUpdate(device types.Device) (types.Device
 	return device, nil
 }
 func (p *createFallbackPlugin) OnDeviceDelete(id string) error { return nil }
-func (p *createFallbackPlugin) OnDevicesList(current []types.Device) ([]types.Device, error) {
+func (p *createFallbackPlugin) OnDeviceDiscover(current []types.Device) ([]types.Device, error) {
 	return current, nil
 }
 func (p *createFallbackPlugin) OnDeviceSearch(q types.SearchQuery, results []types.Device) ([]types.Device, error) {
@@ -50,7 +50,7 @@ func (p *createFallbackPlugin) OnEntityUpdate(entity types.Entity) (types.Entity
 	return entity, nil
 }
 func (p *createFallbackPlugin) OnEntityDelete(deviceID, entityID string) error { return nil }
-func (p *createFallbackPlugin) OnEntitiesList(deviceID string, current []types.Entity) ([]types.Entity, error) {
+func (p *createFallbackPlugin) OnEntityDiscover(deviceID string, current []types.Entity) ([]types.Entity, error) {
 	return current, nil
 }
 func (p *createFallbackPlugin) OnCommand(req types.Command, entity types.Entity) (types.Entity, error) {
@@ -117,12 +117,12 @@ type startupHydrationPlugin struct {
 	entitiesCalls    []string
 }
 
-func (p *startupHydrationPlugin) OnDevicesList(current []types.Device) ([]types.Device, error) {
+func (p *startupHydrationPlugin) OnDeviceDiscover(current []types.Device) ([]types.Device, error) {
 	p.devicesListCalls++
 	return p.devices, nil
 }
 
-func (p *startupHydrationPlugin) OnEntitiesList(deviceID string, current []types.Entity) ([]types.Entity, error) {
+func (p *startupHydrationPlugin) OnEntityDiscover(deviceID string, current []types.Entity) ([]types.Entity, error) {
 	p.entitiesCalls = append(p.entitiesCalls, deviceID)
 	return p.entitiesByDevice[deviceID], nil
 }
@@ -145,17 +145,17 @@ func TestBootstrapStartupTopology_HydratesEntitiesForAllDevices(t *testing.T) {
 		t.Fatalf("bootstrapStartupTopology err=%v", err)
 	}
 	if p.devicesListCalls != 1 {
-		t.Fatalf("OnDevicesList calls=%d want=1", p.devicesListCalls)
+		t.Fatalf("OnDeviceDiscover calls=%d want=1", p.devicesListCalls)
 	}
 	if len(p.entitiesCalls) != 2 {
-		t.Fatalf("OnEntitiesList calls=%d want=2 (%v)", len(p.entitiesCalls), p.entitiesCalls)
+		t.Fatalf("OnEntityDiscover calls=%d want=2 (%v)", len(p.entitiesCalls), p.entitiesCalls)
 	}
 	called := map[string]bool{}
 	for _, d := range p.entitiesCalls {
 		called[d] = true
 	}
 	if !called["dev-a"] || !called["dev-b"] {
-		t.Fatalf("OnEntitiesList missing expected devices: %v", p.entitiesCalls)
+		t.Fatalf("OnEntityDiscover missing expected devices: %v", p.entitiesCalls)
 	}
 
 	if got := r.loadEntity("dev-a", "ent-a1"); got.ID == "" {

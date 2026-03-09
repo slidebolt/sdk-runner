@@ -54,7 +54,7 @@ func TestSaveSnapshot_CreatesSnapshotOnEntity(t *testing.T) {
 	r := newTestRunner(t)
 	seedLightEntity(t, r)
 
-	snap, err := r.SaveSnapshot("dev-001", "light-001", "MovieTime", map[string][]string{"room": {"living-room"}})
+	snap, err := r.CreateSnapshot("dev-001", "light-001", "MovieTime", map[string][]string{"room": {"living-room"}})
 	if err != nil {
 		t.Fatalf("SaveSnapshot failed: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestSaveSnapshot_CreatesSnapshotOnEntity(t *testing.T) {
 
 func TestSaveSnapshot_EntityNotFound(t *testing.T) {
 	r := newTestRunner(t)
-	_, err := r.SaveSnapshot("dev-missing", "ent-missing", "X", nil)
+	_, err := r.CreateSnapshot("dev-missing", "ent-missing", "X", nil)
 	if err == nil {
 		t.Fatal("expected error for missing entity")
 	}
@@ -88,7 +88,7 @@ func TestListSnapshots_OrderedByCreatedAt(t *testing.T) {
 	seedLightEntity(t, r)
 
 	for _, name := range []string{"A", "B", "C"} {
-		if _, err := r.SaveSnapshot("dev-001", "light-001", name, nil); err != nil {
+		if _, err := r.CreateSnapshot("dev-001", "light-001", name, nil); err != nil {
 			t.Fatalf("SaveSnapshot %q failed: %v", name, err)
 		}
 	}
@@ -111,7 +111,7 @@ func TestDeleteSnapshot_RemovesFromEntity(t *testing.T) {
 	r := newTestRunner(t)
 	seedLightEntity(t, r)
 
-	snap, _ := r.SaveSnapshot("dev-001", "light-001", "ToDelete", nil)
+	snap, _ := r.CreateSnapshot("dev-001", "light-001", "ToDelete", nil)
 
 	if err := r.DeleteSnapshot("dev-001", "light-001", snap.ID); err != nil {
 		t.Fatalf("DeleteSnapshot failed: %v", err)
@@ -138,7 +138,7 @@ func TestSnapshotsSurviveFlushAndHydrate(t *testing.T) {
 	r.snapshotStore = newStateStore(r, "file")
 
 	seedLightEntity(t, r)
-	snap, err := r.SaveSnapshot("dev-001", "light-001", "Persist", nil)
+	snap, err := r.CreateSnapshot("dev-001", "light-001", "Persist", nil)
 	if err != nil {
 		t.Fatalf("SaveSnapshot failed: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestRestoreSnapshot_DispatchesCommands(t *testing.T) {
 	r.manifest = types.Manifest{ID: "test-plugin"}
 
 	seedLightEntity(t, r)
-	snap, _ := r.SaveSnapshot("dev-001", "light-001", "Movie", nil)
+	snap, _ := r.CreateSnapshot("dev-001", "light-001", "Movie", nil)
 
 	if err := r.RestoreSnapshot("dev-001", "light-001", snap.ID); err != nil {
 		t.Fatalf("RestoreSnapshot failed: %v", err)

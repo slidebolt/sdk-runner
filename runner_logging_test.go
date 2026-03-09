@@ -15,7 +15,7 @@ func TestRunnerSetAndGetLogLevel(t *testing.T) {
 		logLevel: levelVar,
 	}
 
-	if got := r.GetLogLevel(); got != "info" {
+	if got := r.LogLevel(); got != "info" {
 		t.Fatalf("default level got=%q want=info", got)
 	}
 
@@ -26,8 +26,8 @@ func TestRunnerSetAndGetLogLevel(t *testing.T) {
 	if lvl != "trace" {
 		t.Fatalf("SetLogLevel returned %q want trace", lvl)
 	}
-	if got := r.GetLogLevel(); got != "trace" {
-		t.Fatalf("GetLogLevel got=%q want=trace", got)
+	if got := r.LogLevel(); got != "trace" {
+		t.Fatalf("LogLevel got=%q want=trace", got)
 	}
 
 	logger.Debug("debug-visible")
@@ -49,10 +49,10 @@ func TestRunnerLogLevelIsolationPerInstance(t *testing.T) {
 	if _, err := r1.SetLogLevel("trace"); err != nil {
 		t.Fatalf("r1 SetLogLevel err=%v", err)
 	}
-	if got := r1.GetLogLevel(); got != "trace" {
+	if got := r1.LogLevel(); got != "trace" {
 		t.Fatalf("r1 level=%q want=trace", got)
 	}
-	if got := r2.GetLogLevel(); got != "info" {
+	if got := r2.LogLevel(); got != "info" {
 		t.Fatalf("r2 level=%q want=info", got)
 	}
 }
