@@ -20,10 +20,23 @@ type RawStore interface {
 
 // Config is passed to a plugin during OnInitialize.
 type Config struct {
-	DataDir   string
-	EventSink EventSink
-	RawStore  RawStore
-	Logger    *slog.Logger
+	DataDir       string
+	EventSink     EventSink
+	RawStore      RawStore
+	RegistryCache RegistryCache
+	Logger        *slog.Logger
+}
+
+// RegistryCache provides read access to the global registry state list.
+// Plugins can use this to derive cross-plugin views during discovery/refresh.
+type RegistryCache interface {
+	FindEntities(q types.SearchQuery) ([]RegistryEntity, error)
+}
+
+// RegistryEntity is a registry-cache search result with source plugin metadata.
+type RegistryEntity struct {
+	types.Entity
+	PluginID string `json:"plugin_id"`
 }
 
 // EventSink allows plugin code to emit device-originated events back into

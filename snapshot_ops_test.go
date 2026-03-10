@@ -17,11 +17,13 @@ func newTestRunnerWithPlugin(t *testing.T, p Plugin) *Runner {
 		plugin:      p,
 		statuses:    make(map[string]types.CommandStatus),
 		registry:    make(map[string]types.Registration),
-		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 	}
-	r.stateStore = newStateStore(r, "file")
+	r.stateStore = newMemoryStateStore()
+	r.store = newScriptStore(r.dataDir)
+	r.router = newSubscriptionRouter()
+	r.scriptCache = newScriptRuntimeCache(r.store, r.loadScriptRuntime)
 	return r
 }
 
@@ -149,12 +151,14 @@ func TestSnapshotsSurviveFlushAndHydrate(t *testing.T) {
 		dataDir:     r.dataDir,
 		statuses:    make(map[string]types.CommandStatus),
 		registry:    make(map[string]types.Registration),
-		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 	}
 	r2.stateStore = newMemoryStateStore()
 	r2.snapshotStore = newStateStore(r2, "file")
+	r2.store = newScriptStore(r2.dataDir)
+	r2.router = newSubscriptionRouter()
+	r2.scriptCache = newScriptRuntimeCache(r2.store, r2.loadScriptRuntime)
 	r2.hydrateCanonicalFromSnapshot()
 
 	loaded := r2.loadEntity("dev-001", "light-001")

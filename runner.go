@@ -37,8 +37,9 @@ type Runner struct {
 	registryMu sync.RWMutex
 	registry   map[string]types.Registration
 
-	scriptsMu sync.Mutex
-	scripts   map[scriptKey]*scriptRuntime
+	store       *scriptStore
+	router      *subscriptionRouter
+	scriptCache *scriptRuntimeCache
 
 	lockMu      sync.Mutex
 	deviceLocks map[string]*sync.Mutex
@@ -54,6 +55,8 @@ type Runner struct {
 	snapshotInterval time.Duration
 	snapshotStop     chan struct{}
 	snapshotDone     chan struct{}
+	dynamicQueryStop chan struct{}
+	dynamicQueryDone chan struct{}
 }
 
 var idSeq uint64
@@ -69,10 +72,9 @@ func NewRunner(p Plugin) (*Runner, error) {
 	}
 	logger, levelVar := newLogger(defaultLogServiceName())
 	r := &Runner{
-		plugin:      p,
-						dataDir:    dataDir,
-						statuses:   make(map[string]types.CommandStatus),		registry:    make(map[string]types.Registration),
-		scripts:     make(map[scriptKey]*scriptRuntime),
+		plugin:   p,
+		dataDir:  dataDir,
+		statuses: make(map[string]types.CommandStatus), registry: make(map[string]types.Registration),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 		logger:      logger,
@@ -81,8 +83,46 @@ func NewRunner(p Plugin) (*Runner, error) {
 	r.stateStore = newMemoryStateStore()
 	r.snapshotStore = newStateStore(r, "file")
 	r.snapshotInterval = loadSnapshotInterval()
+	r.store = newScriptStore(r.dataDir)
+	r.router = newSubscriptionRouter()
+	r.scriptCache = newScriptRuntimeCache(r.store, r.loadScriptRuntime)
 	r.hydrateCanonicalFromSnapshot()
 	return r, nil
+}
+
+func (r *Runner) startDynamicQueryLoop() {
+	if r.dynamicQueryStop != nil {
+		return
+	}
+	r.dynamicQueryStop = make(chan struct{})
+	r.dynamicQueryDone = make(chan struct{})
+	go func() {
+		defer close(r.dynamicQueryDone)
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-r.dynamicQueryStop:
+				return
+			case <-t.C:
+				// Keep script runtimes in sync with filesystem changes so
+				// listener-only scripts (no direct command traffic) can
+				// receive cross-plugin events shortly after being written.
+				r.scriptCache.sync()
+				r.refreshAllDynamicQueries()
+			}
+		}
+	}()
+}
+
+func (r *Runner) stopDynamicQueryLoop() {
+	if r.dynamicQueryStop == nil {
+		return
+	}
+	close(r.dynamicQueryStop)
+	<-r.dynamicQueryDone
+	r.dynamicQueryStop = nil
+	r.dynamicQueryDone = nil
 }
 
 func (r *Runner) LogLevel() string {
@@ -156,7 +196,7 @@ func (r *Runner) Run() error {
 
 	initialState := r.loadState("default")
 	var updatedState types.Storage
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
+	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, RegistryCache: r, Logger: r.logger}, initialState)
 	r.rpcSubject = SubjectRPCPrefix + r.manifest.ID
 	r.saveStateSynced("default", updatedState)
 	r.plugin.OnReady()
@@ -172,11 +212,14 @@ func (r *Runner) Run() error {
 	if err := r.bootstrapStartupTopology(); err != nil {
 		return fmt.Errorf("startup topology hydration failed: %w", err)
 	}
+	r.scriptCache.sync()
 	r.startSnapshotLoop()
 	defer func() {
 		r.stopSnapshotLoop()
+		r.stopDynamicQueryLoop()
 		r.flushSnapshot()
 	}()
+	r.startDynamicQueryLoop()
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
 	regData, err = json.Marshal(reg)
@@ -196,6 +239,9 @@ func (r *Runner) Run() error {
 	r.nc.Subscribe(SubjectSearchEntities, r.handleEntitySearch)
 	r.nc.Subscribe(SubjectRegistration, r.handleRegistration)
 	r.nc.Subscribe(SubjectEntityEvents, r.handleEntityEvent)
+	r.nc.Subscribe(SubjectEntityCreated, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
+	r.nc.Subscribe(SubjectEntityUpdated, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
+	r.nc.Subscribe(SubjectEntityDeleted, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
 	r.nc.Subscribe(SubjectDiscoveryProbe, func(m *nats.Msg) {
 		r.nc.Publish(SubjectRegistration, regData)
 	})
@@ -227,7 +273,7 @@ func (r *Runner) Run() error {
 func (r *Runner) runDiscoveryMode() error {
 	_ = os.MkdirAll(r.dataDir, 0o755)
 	initialState := r.loadState("default")
-	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
+	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, RegistryCache: r, Logger: r.logger}, initialState)
 	r.plugin.OnReady()
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -411,6 +457,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			} else if created.DeviceID != "" {
 				r.saveDevice(types.Device{ID: created.DeviceID, SourceID: created.DeviceID, LocalName: created.DeviceID})
 			}
+			r.refreshAllDynamicQueries()
 			result = created
 		}
 
@@ -444,6 +491,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
 			r.saveEntity(updated)
+			r.refreshAllDynamicQueries()
 			result = updated
 		}
 
@@ -460,6 +508,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
 			r.deleteEntity(params.DeviceID, params.EntityID)
+			r.refreshAllDynamicQueries()
 			result = true
 		}
 
@@ -489,6 +538,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 				}
 				r.saveEntity(ent)
 			}
+			r.refreshAllDynamicQueries()
 			result = merged
 		}
 
@@ -1056,6 +1106,9 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 	if err := json.Unmarshal(m.Data, &q); err != nil {
 		return
 	}
+	if q.PluginID != "" && q.PluginID != r.manifest.ID {
+		return
+	}
 	matches := r.searchDevicesLocal(q)
 	if matches == nil {
 		matches = []types.Device{}
@@ -1077,6 +1130,9 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 func (r *Runner) handleEntitySearch(m *nats.Msg) {
 	var q types.SearchQuery
 	if err := json.Unmarshal(m.Data, &q); err != nil {
+		return
+	}
+	if q.PluginID != "" && q.PluginID != r.manifest.ID {
 		return
 	}
 	matches := r.searchEntitiesLocal(q)
@@ -1541,13 +1597,31 @@ func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcE
 	}
 }
 
-// --- File persistence ---
+// --- File persistence & Lifecycle ---
+
+func (r *Runner) publishLifecycle(subject string, payload any) {
+	if r.nc == nil {
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal lifecycle event %s: %v", subject, err)
+		return
+	}
+	if err := r.nc.Publish(subject, data); err != nil {
+		log.Printf("plugin-runner: failed to publish lifecycle event %s: %v", subject, err)
+	}
+}
 
 func (r *Runner) saveDevice(dev types.Device) {
 	_ = r.ensureStateStore().SaveDevice(dev)
 	if r.snapshotStore != nil {
 		_ = r.snapshotStore.SaveDevice(dev)
 	}
+	r.publishLifecycle(SubjectDeviceUpdated, types.BatchDeviceItem{
+		PluginID: r.manifest.ID,
+		Device:   dev,
+	})
 }
 
 func (r *Runner) deleteDevice(id string) {
@@ -1555,6 +1629,10 @@ func (r *Runner) deleteDevice(id string) {
 	if r.snapshotStore != nil {
 		_ = r.snapshotStore.DeleteDevice(id)
 	}
+	r.publishLifecycle(SubjectDeviceDeleted, types.BatchDeviceRef{
+		PluginID: r.manifest.ID,
+		DeviceID: id,
+	})
 }
 
 func (r *Runner) deleteEntity(deviceID, entityID string) {
@@ -1562,6 +1640,11 @@ func (r *Runner) deleteEntity(deviceID, entityID string) {
 	if r.snapshotStore != nil {
 		_ = r.snapshotStore.DeleteEntity(deviceID, entityID)
 	}
+	r.publishLifecycle(SubjectEntityDeleted, types.BatchEntityRef{
+		PluginID: r.manifest.ID,
+		DeviceID: deviceID,
+		EntityID: entityID,
+	})
 }
 
 func (r *Runner) loadDevices() []types.Device {
@@ -1585,6 +1668,11 @@ func (r *Runner) saveEntity(ent types.Entity) {
 	if r.snapshotStore != nil {
 		_ = r.snapshotStore.SaveEntity(ent)
 	}
+	r.publishLifecycle(SubjectEntityUpdated, types.BatchEntityItem{
+		PluginID: r.manifest.ID,
+		DeviceID: ent.DeviceID,
+		Entity:   ent,
+	})
 }
 
 func (r *Runner) loadEntity(deviceID, entityID string) types.Entity {
