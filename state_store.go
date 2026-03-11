@@ -39,11 +39,10 @@ func (r *Runner) ensureStateStore() stateStore {
 	r.lockMu.Lock()
 	defer r.lockMu.Unlock()
 	if r.stateStore == nil {
-		r.stateStore = newMemoryStateStore()
+		r.stateStore = newStateStore(r, "file")
 	}
 	return r.stateStore
 }
-
 type fileStateStore struct {
 	r *Runner
 }
@@ -377,6 +376,20 @@ func cloneEntity(e types.Entity) types.Entity {
 	out.Data.Desired = append([]byte(nil), e.Data.Desired...)
 	out.Data.Reported = append([]byte(nil), e.Data.Reported...)
 	out.Data.Effective = append([]byte(nil), e.Data.Effective...)
+	if len(e.Snapshots) > 0 {
+		out.Snapshots = make(map[string]types.EntitySnapshot, len(e.Snapshots))
+		for id, s := range e.Snapshots {
+			snap := s
+			snap.State = append([]byte(nil), s.State...)
+			if len(s.Labels) > 0 {
+				snap.Labels = make(map[string][]string, len(s.Labels))
+				for k, v := range s.Labels {
+					snap.Labels[k] = append([]string(nil), v...)
+				}
+			}
+			out.Snapshots[id] = snap
+		}
+	}
 	return out
 }
 

@@ -17,11 +17,13 @@ func newTestRunner(t *testing.T) *Runner {
 		dataDir:     t.TempDir(),
 		statuses:    make(map[string]types.CommandStatus),
 		registry:    make(map[string]types.Registration),
-		scripts:     make(map[scriptKey]*scriptRuntime),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 	}
 	r.stateStore = newStateStore(r, "file")
+	r.store = newScriptStore(r.dataDir)
+	r.router = newSubscriptionRouter()
+	r.scriptCache = newScriptRuntimeCache(r.store, r.loadScriptRuntime)
 	return r
 }
 

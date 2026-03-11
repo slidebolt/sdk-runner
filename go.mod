@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/nats-io/nats.go v1.49.0
+	github.com/slidebolt/registry v0.0.0-00010101000000-000000000000
 	github.com/slidebolt/sdk-types v1.20.3
 	github.com/yuin/gopher-lua v1.1.1
 )
@@ -15,3 +16,5 @@ require (
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 )
+
+replace github.com/slidebolt/registry => ../registry

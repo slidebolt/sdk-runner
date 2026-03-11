@@ -37,8 +37,9 @@ type Runner struct {
 	registryMu sync.RWMutex
 	registry   map[string]types.Registration
 
-	scriptsMu sync.Mutex
-	scripts   map[scriptKey]*scriptRuntime
+	store       *scriptStore
+	router      *subscriptionRouter
+	scriptCache *scriptRuntimeCache
 
 	lockMu      sync.Mutex
 	deviceLocks map[string]*sync.Mutex
@@ -54,6 +55,8 @@ type Runner struct {
 	snapshotInterval time.Duration
 	snapshotStop     chan struct{}
 	snapshotDone     chan struct{}
+	dynamicQueryStop chan struct{}
+	dynamicQueryDone chan struct{}
 }
 
 var idSeq uint64
@@ -69,11 +72,9 @@ func NewRunner(p Plugin) (*Runner, error) {
 	}
 	logger, levelVar := newLogger(defaultLogServiceName())
 	r := &Runner{
-		plugin:      p,
-		dataDir:     dataDir,
-		statuses:    make(map[string]types.CommandStatus),
-		registry:    make(map[string]types.Registration),
-		scripts:     make(map[scriptKey]*scriptRuntime),
+		plugin:   p,
+		dataDir:  dataDir,
+		statuses: make(map[string]types.CommandStatus), registry: make(map[string]types.Registration),
 		deviceLocks: make(map[string]*sync.Mutex),
 		fileHash:    make(map[string]string),
 		logger:      logger,
@@ -82,11 +83,49 @@ func NewRunner(p Plugin) (*Runner, error) {
 	r.stateStore = newMemoryStateStore()
 	r.snapshotStore = newStateStore(r, "file")
 	r.snapshotInterval = loadSnapshotInterval()
+	r.store = newScriptStore(r.dataDir)
+	r.router = newSubscriptionRouter()
+	r.scriptCache = newScriptRuntimeCache(r.store, r.loadScriptRuntime)
 	r.hydrateCanonicalFromSnapshot()
 	return r, nil
 }
 
-func (r *Runner) GetLogLevel() string {
+func (r *Runner) startDynamicQueryLoop() {
+	if r.dynamicQueryStop != nil {
+		return
+	}
+	r.dynamicQueryStop = make(chan struct{})
+	r.dynamicQueryDone = make(chan struct{})
+	go func() {
+		defer close(r.dynamicQueryDone)
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-r.dynamicQueryStop:
+				return
+			case <-t.C:
+				// Keep script runtimes in sync with filesystem changes so
+				// listener-only scripts (no direct command traffic) can
+				// receive cross-plugin events shortly after being written.
+				r.scriptCache.sync()
+				r.refreshAllDynamicQueries()
+			}
+		}
+	}()
+}
+
+func (r *Runner) stopDynamicQueryLoop() {
+	if r.dynamicQueryStop == nil {
+		return
+	}
+	close(r.dynamicQueryStop)
+	<-r.dynamicQueryDone
+	r.dynamicQueryStop = nil
+	r.dynamicQueryDone = nil
+}
+
+func (r *Runner) LogLevel() string {
 	if r == nil || r.logLevel == nil {
 		return "info"
 	}
@@ -123,8 +162,28 @@ func (r *Runner) Run() error {
 	if err != nil {
 		return err
 	}
+	var regData []byte
 	for i := 0; i < 5; i++ {
-		r.nc, err = nats.Connect(url)
+		r.nc, err = nats.Connect(url,
+			nats.RetryOnFailedConnect(true),
+			nats.MaxReconnects(-1),
+			nats.ReconnectWait(200*time.Millisecond),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, derr error) {
+				if r.logger != nil {
+					r.logger.Warn("nats disconnected", "error", derr)
+				}
+			}),
+			nats.ReconnectHandler(func(c *nats.Conn) {
+				if r.logger != nil {
+					r.logger.Info("nats reconnected", "url", c.ConnectedUrl())
+				}
+				// Push a fresh registration immediately after reconnect so the
+				// gateway can restore registry/search routing quickly.
+				if len(regData) > 0 {
+					_ = c.Publish(SubjectRegistration, regData)
+				}
+			}),
+		)
 		if err == nil {
 			break
 		}
@@ -137,7 +196,7 @@ func (r *Runner) Run() error {
 
 	initialState := r.loadState("default")
 	var updatedState types.Storage
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
+	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, RegistryCache: r, Logger: r.logger}, initialState)
 	r.rpcSubject = SubjectRPCPrefix + r.manifest.ID
 	r.saveStateSynced("default", updatedState)
 	r.plugin.OnReady()
@@ -153,14 +212,17 @@ func (r *Runner) Run() error {
 	if err := r.bootstrapStartupTopology(); err != nil {
 		return fmt.Errorf("startup topology hydration failed: %w", err)
 	}
+	r.scriptCache.sync()
 	r.startSnapshotLoop()
 	defer func() {
 		r.stopSnapshotLoop()
+		r.stopDynamicQueryLoop()
 		r.flushSnapshot()
 	}()
+	r.startDynamicQueryLoop()
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
-	regData, err := json.Marshal(reg)
+	regData, err = json.Marshal(reg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal registration: %w", err)
 	}
@@ -177,13 +239,32 @@ func (r *Runner) Run() error {
 	r.nc.Subscribe(SubjectSearchEntities, r.handleEntitySearch)
 	r.nc.Subscribe(SubjectRegistration, r.handleRegistration)
 	r.nc.Subscribe(SubjectEntityEvents, r.handleEntityEvent)
+	r.nc.Subscribe(SubjectEntityCreated, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
+	r.nc.Subscribe(SubjectEntityUpdated, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
+	r.nc.Subscribe(SubjectEntityDeleted, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
 	r.nc.Subscribe(SubjectDiscoveryProbe, func(m *nats.Msg) {
 		r.nc.Publish(SubjectRegistration, regData)
 	})
+	// Registration heartbeat: keeps gateway registry converged even if
+	// reconnect/probe messages are missed during turbulence.
+	regStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-regStop:
+				return
+			case <-t.C:
+				_ = r.nc.Publish(SubjectRegistration, regData)
+			}
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+	close(regStop)
 	r.plugin.OnShutdown()
 	_ = r.nc.Drain()
 	return nil
@@ -192,7 +273,7 @@ func (r *Runner) Run() error {
 func (r *Runner) runDiscoveryMode() error {
 	_ = os.MkdirAll(r.dataDir, 0o755)
 	initialState := r.loadState("default")
-	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
+	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, RegistryCache: r, Logger: r.logger}, initialState)
 	r.plugin.OnReady()
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -201,7 +282,7 @@ func (r *Runner) runDiscoveryMode() error {
 	}
 	waitCancel()
 
-	devices, err := r.plugin.OnDevicesList(nil)
+	devices, err := r.plugin.OnDeviceDiscover(nil)
 	if err != nil {
 		return fmt.Errorf("discovery failed: %w", err)
 	}
@@ -238,7 +319,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "logging/get_level":
 		result = map[string]any{
-			"level": r.GetLogLevel(),
+			"level": r.LogLevel(),
 		}
 
 	case "logging/set_level":
@@ -267,7 +348,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "storage/update":
 		current := r.loadState("default")
-		updated, err := r.plugin.OnStorageUpdate(current)
+		updated, err := r.plugin.OnConfigUpdate(current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -281,9 +362,13 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created := r.createDeviceWithFallback(dev)
-		r.saveDevice(created)
-		result = created
+		created, err := r.createDeviceWithFallback(dev)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.saveDevice(created)
+			result = created
+		}
 
 	case "devices/update":
 		var incoming types.Device
@@ -333,7 +418,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case "devices/list":
 		current := r.loadDevices()
-		discovered, err := r.plugin.OnDevicesList(current)
+		discovered, err := r.plugin.OnDeviceDiscover(current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -361,9 +446,20 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created := r.createEntityWithFallback(ent)
-		r.saveEntity(created)
-		result = created
+		created, err := r.createEntityWithFallback(ent)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			r.saveEntity(created)
+			// Also persist the owning device so it is visible on restart.
+			if dev := r.loadDeviceByID(created.DeviceID); dev.ID != "" {
+				r.saveDevice(dev)
+			} else if created.DeviceID != "" {
+				r.saveDevice(types.Device{ID: created.DeviceID, SourceID: created.DeviceID, LocalName: created.DeviceID})
+			}
+			r.refreshAllDynamicQueries()
+			result = created
+		}
 
 	case "entities/update":
 		var incoming types.Entity
@@ -395,6 +491,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
 			r.saveEntity(updated)
+			r.refreshAllDynamicQueries()
 			result = updated
 		}
 
@@ -411,6 +508,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
 			r.deleteEntity(params.DeviceID, params.EntityID)
+			r.refreshAllDynamicQueries()
 			result = true
 		}
 
@@ -423,7 +521,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			break
 		}
 		current := r.loadEntities(params.DeviceID)
-		discovered, err := r.plugin.OnEntitiesList(params.DeviceID, current)
+		discovered, err := r.plugin.OnEntityDiscover(params.DeviceID, current)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -440,6 +538,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 				}
 				r.saveEntity(ent)
 			}
+			r.refreshAllDynamicQueries()
 			result = merged
 		}
 
@@ -512,7 +611,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		source, path, err := r.getScriptSource(params.DeviceID, params.EntityID)
+		source, path, err := r.ScriptGet(params.DeviceID, params.EntityID)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32004, Message: err.Error()}
 		} else {
@@ -535,7 +634,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		path, err := r.putScriptSource(params.DeviceID, params.EntityID, params.Source)
+		path, err := r.ScriptPut(params.DeviceID, params.EntityID, params.Source)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -558,7 +657,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		err := r.deleteScriptSource(params.DeviceID, params.EntityID, params.PurgeState)
+		err := r.ScriptDelete(params.DeviceID, params.EntityID, params.PurgeState)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -580,7 +679,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		state, path := r.getScriptState(params.DeviceID, params.EntityID)
+		state, path := r.ScriptStateGet(params.DeviceID, params.EntityID)
 		result = map[string]any{
 			"plugin_id": r.manifest.ID,
 			"device_id": params.DeviceID,
@@ -599,7 +698,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		path, err := r.putScriptState(params.DeviceID, params.EntityID, params.State)
+		path, err := r.ScriptStatePut(params.DeviceID, params.EntityID, params.State)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -621,7 +720,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		path, err := r.deleteScriptState(params.DeviceID, params.EntityID)
+		path, err := r.ScriptStateDelete(params.DeviceID, params.EntityID)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
@@ -632,6 +731,72 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 				"path":      path,
 				"state":     map[string]any{},
 			}
+		}
+
+	case "entities/snapshots/save":
+		var params struct {
+			DeviceID string              `json:"device_id"`
+			EntityID string              `json:"entity_id"`
+			Name     string              `json:"name"`
+			Labels   map[string][]string `json:"labels,omitempty"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snap, err := r.CreateSnapshot(params.DeviceID, params.EntityID, params.Name, params.Labels)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snap
+		}
+
+	case "entities/snapshots/list":
+		var params struct {
+			DeviceID string `json:"device_id"`
+			EntityID string `json:"entity_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snaps, err := r.ListSnapshots(params.DeviceID, params.EntityID)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snaps
+		}
+
+	case "entities/snapshots/delete":
+		var params struct {
+			DeviceID   string `json:"device_id"`
+			EntityID   string `json:"entity_id"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		if err := r.DeleteSnapshot(params.DeviceID, params.EntityID, params.SnapshotID); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = true
+		}
+
+	case "entities/snapshots/restore":
+		var params struct {
+			DeviceID   string `json:"device_id"`
+			EntityID   string `json:"entity_id"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		if err := r.RestoreSnapshot(params.DeviceID, params.EntityID, params.SnapshotID); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = true
 		}
 
 	default:
@@ -751,7 +916,7 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 				"total_elapsed_ms", time.Since(cmdStart).Milliseconds())
 		}
 	}()
-	go r.dispatchLuaCommand(cmd)
+	go r.handleCommand(cmd)
 	return status, nil
 }
 
@@ -783,7 +948,15 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	}
 	updated, err := r.plugin.OnEvent(event, ent)
 	if err != nil {
-		return types.Entity{}, err
+		// Plugin couldn't process the event (e.g. unsupported domain), but the
+		// event was received. Apply the raw payload so state is up to date.
+		if r.logger != nil {
+			r.logger.Warn("plugin OnEvent error; applying raw payload", "plugin", r.manifest.ID, "device", evt.DeviceID, "entity", evt.EntityID, "error", err.Error())
+		}
+		updated = ent
+		updated.Data.Reported = evt.Payload
+		updated.Data.Effective = evt.Payload
+		updated.Data.SyncStatus = types.SyncStatusSynced
 	}
 	updated.Data.LastEventID = event.ID
 	if event.CorrelationID != "" {
@@ -822,7 +995,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 			log.Printf("plugin-runner: failed to publish entity event: %v", err)
 		}
 	}
-	go r.dispatchLuaEvent(envelope)
+	go r.handleEvent(envelope)
 
 	return updated, nil
 }
@@ -867,7 +1040,7 @@ func (r *Runner) handleEntityEvent(m *nats.Msg) {
 	if env.PluginID == r.manifest.ID {
 		return
 	}
-	r.dispatchLuaEvent(env)
+	r.handleEvent(env)
 }
 
 func (r *Runner) getCommandStatus(id string) (types.CommandStatus, bool) {
@@ -933,6 +1106,9 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 	if err := json.Unmarshal(m.Data, &q); err != nil {
 		return
 	}
+	if q.PluginID != "" && q.PluginID != r.manifest.ID {
+		return
+	}
 	matches := r.searchDevicesLocal(q)
 	if matches == nil {
 		matches = []types.Device{}
@@ -954,6 +1130,9 @@ func (r *Runner) handleDeviceSearch(m *nats.Msg) {
 func (r *Runner) handleEntitySearch(m *nats.Msg) {
 	var q types.SearchQuery
 	if err := json.Unmarshal(m.Data, &q); err != nil {
+		return
+	}
+	if q.PluginID != "" && q.PluginID != r.manifest.ID {
 		return
 	}
 	matches := r.searchEntitiesLocal(q)
@@ -1247,7 +1426,7 @@ func (r *Runner) callCreateCommand(pluginID, deviceID, entityID string, payload 
 
 func (r *Runner) refreshDevices() ([]types.Device, error) {
 	current := r.loadDevices()
-	discovered, err := r.plugin.OnDevicesList(current)
+	discovered, err := r.plugin.OnDeviceDiscover(current)
 	if err != nil {
 		return nil, err
 	}
@@ -1266,7 +1445,7 @@ func (r *Runner) refreshDevices() ([]types.Device, error) {
 
 func (r *Runner) bootstrapStartupTopology() error {
 	current := r.loadDevices()
-	discovered, err := r.plugin.OnDevicesList(current)
+	discovered, err := r.plugin.OnDeviceDiscover(current)
 	if err != nil {
 		return err
 	}
@@ -1290,7 +1469,7 @@ func (r *Runner) bootstrapStartupTopology() error {
 
 func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
 	current := r.loadEntities(deviceID)
-	discovered, err := r.plugin.OnEntitiesList(deviceID, current)
+	discovered, err := r.plugin.OnEntityDiscover(deviceID, current)
 	if err != nil {
 		return nil, err
 	}
@@ -1310,7 +1489,7 @@ func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
 	return merged, nil
 }
 
-func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
+func (r *Runner) createDeviceWithFallback(dev types.Device) (types.Device, error) {
 	input := dev
 	if strings.TrimSpace(input.ID) == "" {
 		input.ID = strings.TrimSpace(input.SourceID)
@@ -1327,7 +1506,7 @@ func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
 		if r.logger != nil {
 			r.logger.Warn("devices/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.ID, "error", err.Error())
 		}
-		return input
+		return input, err
 	}
 
 	if strings.TrimSpace(created.ID) == "" {
@@ -1339,10 +1518,10 @@ func (r *Runner) createDeviceWithFallback(dev types.Device) types.Device {
 	if created.LocalName == "" {
 		created.LocalName = created.Name()
 	}
-	return created
+	return created, nil
 }
 
-func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
+func (r *Runner) createEntityWithFallback(ent types.Entity) (types.Entity, error) {
 	input := ent
 	if strings.TrimSpace(input.ID) == "" {
 		input.ID = strings.TrimSpace(input.SourceID)
@@ -1369,7 +1548,7 @@ func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
 		if r.logger != nil {
 			r.logger.Warn("entities/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.DeviceID, "entity_id", input.ID, "error", err.Error())
 		}
-		return input
+		return input, err
 	}
 
 	if strings.TrimSpace(created.ID) == "" {
@@ -1390,7 +1569,7 @@ func (r *Runner) createEntityWithFallback(ent types.Entity) types.Entity {
 	if created.Data.UpdatedAt.IsZero() {
 		created.Data.UpdatedAt = input.Data.UpdatedAt
 	}
-	return created
+	return created, nil
 }
 
 func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcErr *types.RPCError) {
@@ -1418,18 +1597,54 @@ func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcE
 	}
 }
 
-// --- File persistence ---
+// --- File persistence & Lifecycle ---
+
+func (r *Runner) publishLifecycle(subject string, payload any) {
+	if r.nc == nil {
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("plugin-runner: failed to marshal lifecycle event %s: %v", subject, err)
+		return
+	}
+	if err := r.nc.Publish(subject, data); err != nil {
+		log.Printf("plugin-runner: failed to publish lifecycle event %s: %v", subject, err)
+	}
+}
 
 func (r *Runner) saveDevice(dev types.Device) {
 	_ = r.ensureStateStore().SaveDevice(dev)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.SaveDevice(dev)
+	}
+	r.publishLifecycle(SubjectDeviceUpdated, types.BatchDeviceItem{
+		PluginID: r.manifest.ID,
+		Device:   dev,
+	})
 }
 
 func (r *Runner) deleteDevice(id string) {
 	_ = r.ensureStateStore().DeleteDevice(id)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.DeleteDevice(id)
+	}
+	r.publishLifecycle(SubjectDeviceDeleted, types.BatchDeviceRef{
+		PluginID: r.manifest.ID,
+		DeviceID: id,
+	})
 }
 
 func (r *Runner) deleteEntity(deviceID, entityID string) {
 	_ = r.ensureStateStore().DeleteEntity(deviceID, entityID)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.DeleteEntity(deviceID, entityID)
+	}
+	r.publishLifecycle(SubjectEntityDeleted, types.BatchEntityRef{
+		PluginID: r.manifest.ID,
+		DeviceID: deviceID,
+		EntityID: entityID,
+	})
 }
 
 func (r *Runner) loadDevices() []types.Device {
@@ -1450,6 +1665,14 @@ func (r *Runner) loadDeviceByID(id string) types.Device {
 
 func (r *Runner) saveEntity(ent types.Entity) {
 	_ = r.ensureStateStore().SaveEntity(ent)
+	if r.snapshotStore != nil {
+		_ = r.snapshotStore.SaveEntity(ent)
+	}
+	r.publishLifecycle(SubjectEntityUpdated, types.BatchEntityItem{
+		PluginID: r.manifest.ID,
+		DeviceID: ent.DeviceID,
+		Entity:   ent,
+	})
 }
 
 func (r *Runner) loadEntity(deviceID, entityID string) types.Entity {
@@ -1464,7 +1687,7 @@ func (r *Runner) resolveEntity(deviceID, entityID string) types.Entity {
 	if ent := r.loadEntity(deviceID, entityID); ent.ID != "" {
 		return ent
 	}
-	list, err := r.plugin.OnEntitiesList(deviceID, r.loadEntities(deviceID))
+	list, err := r.plugin.OnEntityDiscover(deviceID, r.loadEntities(deviceID))
 	if err != nil {
 		return types.Entity{}
 	}

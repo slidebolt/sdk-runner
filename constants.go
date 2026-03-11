@@ -33,4 +33,17 @@ const (
 	SubjectSearchPlugins  = "slidebolt.search.plugins"
 	SubjectEntityEvents   = "slidebolt.entity.events"
 	SubjectCommandStatus  = "slidebolt.command.status"
+	SubjectGatewayDiscovery = "slidebolt.gateway.discovery"
+
+	// Lifecycle events
+	SubjectDeviceCreated = "slidebolt.device.created"
+	SubjectDeviceUpdated = "slidebolt.device.updated"
+	SubjectDeviceDeleted = "slidebolt.device.deleted"
+	SubjectEntityCreated = "slidebolt.entity.created"
+	SubjectEntityUpdated = "slidebolt.entity.updated"
+	SubjectEntityDeleted = "slidebolt.entity.deleted"
+
+	// Registry Query events
+	SubjectRegistryQueryEntities = "slidebolt.registry.query.entities"
+	SubjectRegistryQueryDevices  = "slidebolt.registry.query.devices"
 )

@@ -20,10 +20,23 @@ type RawStore interface {
 
 // Config is passed to a plugin during OnInitialize.
 type Config struct {
-	DataDir   string
-	EventSink EventSink
-	RawStore  RawStore
-	Logger    *slog.Logger
+	DataDir       string
+	EventSink     EventSink
+	RawStore      RawStore
+	RegistryCache RegistryCache
+	Logger        *slog.Logger
+}
+
+// RegistryCache provides read access to the global registry state list.
+// Plugins can use this to derive cross-plugin views during discovery/refresh.
+type RegistryCache interface {
+	FindEntities(q types.SearchQuery) ([]RegistryEntity, error)
+}
+
+// RegistryEntity is a registry-cache search result with source plugin metadata.
+type RegistryEntity struct {
+	types.Entity
+	PluginID string `json:"plugin_id"`
 }
 
 // EventSink allows plugin code to emit device-originated events back into
@@ -40,23 +53,26 @@ type Plugin interface {
 	// Lifecycle
 	OnInitialize(config Config, state types.Storage) (types.Manifest, types.Storage)
 	OnReady()
+	// WaitReady blocks until the plugin is fully initialised and ready to serve
+	// traffic. Unlike the other lifecycle hooks it is not a callback — the runner
+	// calls it synchronously after OnReady and will not proceed until it returns.
 	WaitReady(ctx context.Context) error
 	OnShutdown()
 	OnHealthCheck() (string, error)
-	OnStorageUpdate(current types.Storage) (types.Storage, error)
+	OnConfigUpdate(current types.Storage) (types.Storage, error)
 
 	// Devices
 	OnDeviceCreate(device types.Device) (types.Device, error)
 	OnDeviceUpdate(device types.Device) (types.Device, error)
 	OnDeviceDelete(id string) error
-	OnDevicesList(current []types.Device) ([]types.Device, error)
+	OnDeviceDiscover(current []types.Device) ([]types.Device, error)
 	OnDeviceSearch(q types.SearchQuery, results []types.Device) ([]types.Device, error)
 
 	// Entities
 	OnEntityCreate(entity types.Entity) (types.Entity, error)
 	OnEntityUpdate(entity types.Entity) (types.Entity, error)
 	OnEntityDelete(deviceID, entityID string) error
-	OnEntitiesList(deviceID string, current []types.Entity) ([]types.Entity, error)
+	OnEntityDiscover(deviceID string, current []types.Entity) ([]types.Entity, error)
 
 	// Commands and Events
 	OnCommand(req types.Command, entity types.Entity) (types.Entity, error)

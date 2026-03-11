@@ -2,6 +2,7 @@ package runner
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,6 +15,29 @@ func TestLoadSnapshotInterval_Default30s(t *testing.T) {
 	_ = os.Unsetenv(EnvStateSnapshotIntervalSec)
 	if got := loadSnapshotInterval(); got != 30*time.Second {
 		t.Fatalf("interval=%v want=30s", got)
+	}
+}
+
+// TestSaveDevice_NotWrittenToFileBeforeSnapshotFlush replicates the integration
+// failure TestDeviceFileWrittenOnCreate. Production NewRunner() uses a memory
+// primary store; files only appear after flushSnapshot() fires (every 30s by
+// default). This test FAILS until synchronous or write-through persistence is
+// implemented.
+func TestSaveDevice_NotWrittenToFileBeforeSnapshotFlush(t *testing.T) {
+	r := newTestRunner(t)
+	r.stateStore = newMemoryStateStore()       // mirrors production NewRunner()
+	r.snapshotStore = newStateStore(r, "file") // mirrors production NewRunner()
+
+	r.saveDevice(types.Device{ID: "dev-snap", SourceID: "src-snap", LocalName: "Snap Device"})
+	r.saveEntity(types.Entity{ID: "ent-snap", SourceID: "src-ent-snap", DeviceID: "dev-snap", Domain: "switch"})
+
+	deviceFile := filepath.Join(r.dataDir, "devices", "dev-snap.json")
+	if _, err := os.Stat(deviceFile); err != nil {
+		t.Fatalf("BUG: device file not written synchronously (mirrors TestDeviceFileWrittenOnCreate): %v", err)
+	}
+	entityFile := filepath.Join(r.dataDir, "devices", "dev-snap", "entities", "ent-snap.json")
+	if _, err := os.Stat(entityFile); err != nil {
+		t.Fatalf("BUG: entity file not written synchronously (mirrors TestDeviceFileWrittenWhenEntityCreated): %v", err)
 	}
 }
 
