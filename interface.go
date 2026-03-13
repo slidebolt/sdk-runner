@@ -2,79 +2,49 @@ package runner
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 
+	regsvc "github.com/slidebolt/registry"
 	"github.com/slidebolt/sdk-types"
 )
 
-// RawStore provides plugin-private raw data storage.
-// Only the plugin that owns a device/entity may read or write its raw data.
-// Raw files live under {dataDir}/raw/ and are invisible to the canonical store.
-type RawStore interface {
-	ReadRawDevice(deviceID string) (json.RawMessage, error)
-	WriteRawDevice(deviceID string, data json.RawMessage) error
-	ReadRawEntity(deviceID, entityID string) (json.RawMessage, error)
-	WriteRawEntity(deviceID, entityID string, data json.RawMessage) error
+// PluginContext is the dependency-injection container for a plugin.
+type PluginContext struct {
+	Logger *slog.Logger
+
+	// Active Services provided by the Runner
+	Registry  *regsvc.Registry  // Direct registry access: state/devices/entities/scripts/query
+	Events    EventService      // Publishes state changes
+	Commands  CommandService    // Sends actions to other devices
+	Scheduler SchedulerService  // Periodic job scheduling
 }
 
-// Config is passed to a plugin during OnInitialize.
-type Config struct {
-	DataDir       string
-	EventSink     EventSink
-	RawStore      RawStore
-	RegistryCache RegistryCache
-	Logger        *slog.Logger
+// EventService emits device state changes asynchronously.
+type EventService interface {
+	PublishEvent(evt types.InboundEvent) error
 }
 
-// RegistryCache provides read access to the global registry state list.
-// Plugins can use this to derive cross-plugin views during discovery/refresh.
-type RegistryCache interface {
-	FindEntities(q types.SearchQuery) ([]RegistryEntity, error)
+// CommandService allows plugins to control other plugins.
+type CommandService interface {
+	SendCommand(req types.Command) error
 }
 
-// RegistryEntity is a registry-cache search result with source plugin metadata.
-type RegistryEntity struct {
-	types.Entity
-	PluginID string `json:"plugin_id"`
-}
-
-// EventSink allows plugin code to emit device-originated events back into
-// the system after completing last-mile work (e.g. after an HTTP call to
-// a real device confirms a command was applied).
-type EventSink interface {
-	EmitEvent(evt types.InboundEvent) error
-}
-
-// Plugin is the interface every plugin must implement.
-// The runner handles all NATS wiring, storage, and command/event lifecycle —
-// the plugin only implements the domain logic for each hook.
+// Plugin is the simplified, reaction-only interface.
 type Plugin interface {
-	// Lifecycle
-	OnInitialize(config Config, state types.Storage) (types.Manifest, types.Storage)
-	OnReady()
-	// WaitReady blocks until the plugin is fully initialised and ready to serve
-	// traffic. Unlike the other lifecycle hooks it is not a callback — the runner
-	// calls it synchronously after OnReady and will not proceed until it returns.
-	WaitReady(ctx context.Context) error
-	OnShutdown()
-	OnHealthCheck() (string, error)
-	OnConfigUpdate(current types.Storage) (types.Storage, error)
+	// 1. Lifecycle
+	// Initialize defines the schema and initial setup.
+	Initialize(ctx PluginContext) (types.Manifest, error)
 
-	// Devices
-	OnDeviceCreate(device types.Device) (types.Device, error)
-	OnDeviceUpdate(device types.Device) (types.Device, error)
-	OnDeviceDelete(id string) error
-	OnDeviceDiscover(current []types.Device) ([]types.Device, error)
-	OnDeviceSearch(q types.SearchQuery, results []types.Device) ([]types.Device, error)
+	// Start begins background workers, polling, or network connections.
+	Start(ctx context.Context) error
 
-	// Entities
-	OnEntityCreate(entity types.Entity) (types.Entity, error)
-	OnEntityUpdate(entity types.Entity) (types.Entity, error)
-	OnEntityDelete(deviceID, entityID string) error
-	OnEntityDiscover(deviceID string, current []types.Entity) ([]types.Entity, error)
+	// Stop gracefully tears down all background activity.
+	Stop() error
 
-	// Commands and Events
-	OnCommand(req types.Command, entity types.Entity) (types.Entity, error)
-	OnEvent(evt types.Event, entity types.Entity) (types.Entity, error)
+	// 2. Reactions
+	// OnReset is triggered when the user requests a hard wipe of plugin state.
+	OnReset() error
+
+	// OnCommand is triggered when the system requests an action on a device.
+	OnCommand(req types.Command, entity types.Entity) error
 }

@@ -2,8 +2,6 @@ package runner
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	regsvc "github.com/slidebolt/registry"
 	"github.com/slidebolt/sdk-types"
 )
 
@@ -34,29 +34,11 @@ type Runner struct {
 	statusMu sync.RWMutex
 	statuses map[string]types.CommandStatus
 
-	registryMu sync.RWMutex
-	registry   map[string]types.Registration
-
-	store       *scriptStore
-	router      *subscriptionRouter
-	scriptCache *scriptRuntimeCache
-
-	lockMu      sync.Mutex
-	deviceLocks map[string]*sync.Mutex
-
-	hashMu   sync.RWMutex
-	fileHash map[string]string
+	reg       *regsvc.Registry
+	scheduler *scheduler
 
 	logger   *slog.Logger
 	logLevel *slog.LevelVar
-
-	stateStore       stateStore
-	snapshotStore    stateStore
-	snapshotInterval time.Duration
-	snapshotStop     chan struct{}
-	snapshotDone     chan struct{}
-	dynamicQueryStop chan struct{}
-	dynamicQueryDone chan struct{}
 }
 
 var idSeq uint64
@@ -66,63 +48,32 @@ func nextID(prefix string) string {
 }
 
 func NewRunner(p Plugin) (*Runner, error) {
-	dataDir, err := RequireEnv(EnvPluginData)
+	dataDir, err := RequireEnv(types.EnvPluginDataDir)
 	if err != nil {
 		return nil, err
 	}
+	namespace := "runner-local"
+	if rpcSubject := strings.TrimSpace(os.Getenv(types.EnvPluginRPCSbj)); rpcSubject != "" {
+		namespace = strings.TrimPrefix(rpcSubject, types.SubjectRPCPrefix)
+		if strings.TrimSpace(namespace) == "" {
+			namespace = "runner-local"
+		}
+	}
+	dataDirRoot := dataDir
+	if filepath.Base(dataDir) == namespace {
+		dataDirRoot = filepath.Dir(dataDir)
+	}
 	logger, levelVar := newLogger(defaultLogServiceName())
 	r := &Runner{
-		plugin:   p,
-		dataDir:  dataDir,
-		statuses: make(map[string]types.CommandStatus), registry: make(map[string]types.Registration),
-		deviceLocks: make(map[string]*sync.Mutex),
-		fileHash:    make(map[string]string),
-		logger:      logger,
-		logLevel:    levelVar,
+		plugin:    p,
+		dataDir:   dataDir,
+		statuses:  make(map[string]types.CommandStatus),
+		scheduler: newScheduler(),
+		logger:    logger,
+		logLevel:  levelVar,
 	}
-	r.stateStore = newMemoryStateStore()
-	r.snapshotStore = newStateStore(r, "file")
-	r.snapshotInterval = loadSnapshotInterval()
-	r.store = newScriptStore(r.dataDir)
-	r.router = newSubscriptionRouter()
-	r.scriptCache = newScriptRuntimeCache(r.store, r.loadScriptRuntime)
-	r.hydrateCanonicalFromSnapshot()
+	r.reg = regsvc.RegistryService(namespace, regsvc.WithDataDir(dataDirRoot), regsvc.WithPersist(regsvc.PersistOnChange))
 	return r, nil
-}
-
-func (r *Runner) startDynamicQueryLoop() {
-	if r.dynamicQueryStop != nil {
-		return
-	}
-	r.dynamicQueryStop = make(chan struct{})
-	r.dynamicQueryDone = make(chan struct{})
-	go func() {
-		defer close(r.dynamicQueryDone)
-		t := time.NewTicker(500 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-r.dynamicQueryStop:
-				return
-			case <-t.C:
-				// Keep script runtimes in sync with filesystem changes so
-				// listener-only scripts (no direct command traffic) can
-				// receive cross-plugin events shortly after being written.
-				r.scriptCache.sync()
-				r.refreshAllDynamicQueries()
-			}
-		}
-	}()
-}
-
-func (r *Runner) stopDynamicQueryLoop() {
-	if r.dynamicQueryStop == nil {
-		return
-	}
-	close(r.dynamicQueryStop)
-	<-r.dynamicQueryDone
-	r.dynamicQueryStop = nil
-	r.dynamicQueryDone = nil
 }
 
 func (r *Runner) LogLevel() string {
@@ -158,7 +109,7 @@ func (r *Runner) Run() error {
 		return r.runDiscoveryMode()
 	}
 
-	url, err := RequireEnv(EnvNATSURL)
+	url, err := RequireEnv(types.EnvNATSURL)
 	if err != nil {
 		return err
 	}
@@ -180,7 +131,7 @@ func (r *Runner) Run() error {
 				// Push a fresh registration immediately after reconnect so the
 				// gateway can restore registry/search routing quickly.
 				if len(regData) > 0 {
-					_ = c.Publish(SubjectRegistration, regData)
+					_ = c.Publish(types.SubjectRegistration, regData)
 				}
 			}),
 		)
@@ -194,56 +145,42 @@ func (r *Runner) Run() error {
 	}
 	defer r.nc.Close()
 
-	initialState := r.loadState("default")
-	var updatedState types.Storage
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, RegistryCache: r, Logger: r.logger}, initialState)
-	r.rpcSubject = SubjectRPCPrefix + r.manifest.ID
-	r.saveStateSynced("default", updatedState)
-	r.plugin.OnReady()
+	ctx := PluginContext{
+		Registry:  r.reg,
+		Logger:    r.logger,
+		Events:    r,
+		Commands:  r,
+		Scheduler: r.scheduler,
+	}
+	var errInit error
+	r.manifest, errInit = r.plugin.Initialize(ctx)
+	if errInit != nil {
+		return fmt.Errorf("plugin initialization failed: %w", errInit)
+	}
+	r.rpcSubject = types.SubjectRPCPrefix + r.manifest.ID
+
+	r.scheduler.start()
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := r.plugin.WaitReady(waitCtx); err != nil {
-		log.Printf("plugin-runner: WaitReady failed: %v; proceeding with registration anyway", err)
+	if err := r.plugin.Start(waitCtx); err != nil {
+		log.Printf("plugin-runner: Start failed: %v; proceeding with registration anyway", err)
 	}
 	waitCancel()
-
-	// Enforce deterministic topology hydration before accepting RPC traffic:
-	// devices first, then entities for every known device.
-	if err := r.bootstrapStartupTopology(); err != nil {
-		return fmt.Errorf("startup topology hydration failed: %w", err)
-	}
-	r.scriptCache.sync()
-	r.startSnapshotLoop()
-	defer func() {
-		r.stopSnapshotLoop()
-		r.stopDynamicQueryLoop()
-		r.flushSnapshot()
-	}()
-	r.startDynamicQueryLoop()
 
 	reg := types.Registration{Manifest: r.manifest, RPCSubject: r.rpcSubject}
 	regData, err = json.Marshal(reg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal registration: %w", err)
 	}
-	r.registryMu.Lock()
-	r.registry[r.manifest.ID] = reg
-	r.registryMu.Unlock()
-	if err := r.nc.Publish(SubjectRegistration, regData); err != nil {
+	if err := r.nc.Publish(types.SubjectRegistration, regData); err != nil {
 		log.Printf("plugin-runner: failed to publish registration: %v", err)
 	}
 
 	r.nc.Subscribe(r.rpcSubject, r.handleRPC)
-	r.nc.Subscribe(SubjectSearchPlugins, r.handlePluginSearch)
-	r.nc.Subscribe(SubjectSearchDevices, r.handleDeviceSearch)
-	r.nc.Subscribe(SubjectSearchEntities, r.handleEntitySearch)
-	r.nc.Subscribe(SubjectRegistration, r.handleRegistration)
-	r.nc.Subscribe(SubjectEntityEvents, r.handleEntityEvent)
-	r.nc.Subscribe(SubjectEntityCreated, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
-	r.nc.Subscribe(SubjectEntityUpdated, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
-	r.nc.Subscribe(SubjectEntityDeleted, func(m *nats.Msg) { r.refreshAllDynamicQueries() })
-	r.nc.Subscribe(SubjectDiscoveryProbe, func(m *nats.Msg) {
-		r.nc.Publish(SubjectRegistration, regData)
+	r.nc.Subscribe(types.SubjectSearchPlugins, r.handlePluginSearch)
+	r.nc.Subscribe(types.SubjectRegistration, r.handleRegistration)
+	r.nc.Subscribe(types.SubjectDiscoveryProbe, func(m *nats.Msg) {
+		r.nc.Publish(types.SubjectRegistration, regData)
 	})
 	// Registration heartbeat: keeps gateway registry converged even if
 	// reconnect/probe messages are missed during turbulence.
@@ -256,7 +193,7 @@ func (r *Runner) Run() error {
 			case <-regStop:
 				return
 			case <-t.C:
-				_ = r.nc.Publish(SubjectRegistration, regData)
+				_ = r.nc.Publish(types.SubjectRegistration, regData)
 			}
 		}
 	}()
@@ -265,27 +202,37 @@ func (r *Runner) Run() error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	close(regStop)
-	r.plugin.OnShutdown()
+	r.scheduler.stop()
+	r.plugin.Stop()
 	_ = r.nc.Drain()
 	return nil
 }
 
 func (r *Runner) runDiscoveryMode() error {
 	_ = os.MkdirAll(r.dataDir, 0o755)
-	initialState := r.loadState("default")
-	r.manifest, _ = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, RegistryCache: r, Logger: r.logger}, initialState)
-	r.plugin.OnReady()
+	ctx := PluginContext{
+		Registry:  r.reg,
+		Logger:    r.logger,
+		Events:    r,
+		Commands:  r,
+		Scheduler: r.scheduler,
+	}
+	var err error
+	r.manifest, err = r.plugin.Initialize(ctx)
+	if err != nil {
+		return fmt.Errorf("plugin initialization failed: %w", err)
+	}
 
+	r.scheduler.start()
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := r.plugin.WaitReady(waitCtx); err != nil {
-		log.Printf("plugin-runner: WaitReady failed in discovery mode: %v; proceeding anyway", err)
+	if err := r.plugin.Start(waitCtx); err != nil {
+		log.Printf("plugin-runner: Start failed in discovery mode: %v; proceeding anyway", err)
 	}
 	waitCancel()
 
-	devices, err := r.plugin.OnDeviceDiscover(nil)
-	if err != nil {
-		return fmt.Errorf("discovery failed: %w", err)
-	}
+	time.Sleep(2 * time.Second) // wait for lazy discovery routines
+	r.scheduler.stop()
+	devices := r.reg.LoadDevices()
 
 	output, err := json.MarshalIndent(devices, "", "  ")
 	if err != nil {
@@ -306,23 +253,18 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 	var rpcErr *types.RPCError
 
 	switch req.Method {
-	case HealthEndpoint:
-		status, err := r.plugin.OnHealthCheck()
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = map[string]string{"status": status, "service": "plugin"}
-		}
+	case types.RPCMethodHealthCheck:
+		result = map[string]string{"status": "perfect", "service": "plugin"}
 
-	case "initialize":
+	case types.RPCMethodInitialize:
 		result = r.manifest
 
-	case "logging/get_level":
+	case types.RPCMethodLoggingGetLevel:
 		result = map[string]any{
 			"level": r.LogLevel(),
 		}
 
-	case "logging/set_level":
+	case types.RPCMethodLoggingSetLevel:
 		var payload struct {
 			Level string `json:"level"`
 		}
@@ -346,31 +288,62 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			"level": level,
 		}
 
-	case "storage/update":
-		current := r.loadState("default")
-		updated, err := r.plugin.OnConfigUpdate(current)
-		if err != nil {
+	case types.RPCMethodStorageUpdate:
+		var newConfig types.Storage
+		if err := json.Unmarshal(req.Params, &newConfig); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		if err := r.reg.SaveState(newConfig); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveStateSynced("default", updated)
-			result = updated
+			break
+		}
+		result = newConfig
+
+	case types.RPCMethodStorageFlush:
+		if err := r.reg.Flush(); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+			break
+		}
+		result = map[string]any{"ok": true}
+
+	case types.RPCMethodPluginReset:
+		if err := r.plugin.OnReset(); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+			break
+		}
+		result = map[string]any{
+			"ok": true,
 		}
 
-	case "devices/create":
+	case types.RPCMethodDevicesCreate:
 		var dev types.Device
 		if err := json.Unmarshal(req.Params, &dev); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created, err := r.createDeviceWithFallback(dev)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveDevice(created)
-			result = created
+		if strings.TrimSpace(dev.ID) == "" {
+			dev.ID = strings.TrimSpace(dev.SourceID)
 		}
+		if strings.TrimSpace(dev.SourceID) == "" {
+			dev.SourceID = dev.ID
+		}
+		if strings.TrimSpace(dev.LocalName) == "" {
+			dev.LocalName = dev.Name()
+		}
+		_, existed := r.reg.LoadDevice(dev.ID)
+		if err := r.reg.SaveDevice(dev); err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+			break
+		}
+		if existed {
+			r.publishLifecycle(types.SubjectDeviceUpdated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
+		} else {
+			r.publishLifecycle(types.SubjectDeviceCreated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
+		}
+		result = dev
 
-	case "devices/update":
+	case types.RPCMethodDevicesUpdate:
 		var incoming types.Device
 		if err := json.Unmarshal(req.Params, &incoming); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
@@ -378,8 +351,8 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 		// Merge with persisted data so source fields (source_id, source_name)
 		// and the user field (local_name) never overwrite each other.
-		dev := r.loadDeviceByID(incoming.ID)
-		if dev.ID == "" {
+		dev, ok := r.reg.LoadDevice(incoming.ID)
+		if !ok {
 			dev = incoming
 		} else {
 			if incoming.SourceID != "" {
@@ -395,73 +368,69 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 				dev.Labels = incoming.Labels
 			}
 		}
-		updated, err := r.plugin.OnDeviceUpdate(dev)
-		if err != nil {
+		if err := r.reg.SaveDevice(dev); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveDevice(updated)
-			result = updated
+			break
 		}
+		if ok {
+			r.publishLifecycle(types.SubjectDeviceUpdated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
+		} else {
+			r.publishLifecycle(types.SubjectDeviceCreated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
+		}
+		result = dev
 
-	case "devices/delete":
+	case types.RPCMethodDevicesDelete:
 		var id string
 		if err := json.Unmarshal(req.Params, &id); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		if err := r.plugin.OnDeviceDelete(id); err != nil {
+		if err := r.reg.DeleteDevice(id); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.deleteDevice(id)
-			result = true
+			break
 		}
+		r.publishLifecycle(types.SubjectDeviceDeleted, types.BatchDeviceRef{PluginID: r.manifest.ID, DeviceID: id})
+		result = true
 
-	case "devices/list":
-		current := r.loadDevices()
-		discovered, err := r.plugin.OnDeviceDiscover(current)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			merged := ReconcileDevicesAdditive(current, discovered)
-			for _, dev := range merged {
-				if strings.TrimSpace(dev.ID) == "" {
-					continue
-				}
-				r.saveDevice(dev)
-			}
-			result = merged
+	case types.RPCMethodDevicesList:
+		devices := r.reg.LoadDevices()
+		r.publishLifecycle(types.SubjectDeviceRead, types.BatchDeviceRead{PluginID: r.manifest.ID, Count: len(devices)})
+		result = devices
+
+	case types.RPCMethodDevicesRefresh:
+		devices := r.reg.LoadDevices()
+		for _, dev := range devices {
+			r.publishLifecycle(types.SubjectDeviceUpdated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
 		}
+		result = devices
 
-	case "devices/refresh":
-		refreshed, err := r.refreshDevices()
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = refreshed
-		}
-
-	case "entities/create":
+	case types.RPCMethodEntitiesCreate:
 		var ent types.Entity
 		if err := json.Unmarshal(req.Params, &ent); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		created, err := r.createEntityWithFallback(ent)
-		if err != nil {
+		_, existed := r.reg.LoadEntity(ent.DeviceID, ent.ID)
+		if err := r.reg.SaveEntity(ent); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveEntity(created)
-			// Also persist the owning device so it is visible on restart.
-			if dev := r.loadDeviceByID(created.DeviceID); dev.ID != "" {
-				r.saveDevice(dev)
-			} else if created.DeviceID != "" {
-				r.saveDevice(types.Device{ID: created.DeviceID, SourceID: created.DeviceID, LocalName: created.DeviceID})
-			}
-			r.refreshAllDynamicQueries()
-			result = created
+			break
 		}
+		if existed {
+			r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{PluginID: r.manifest.ID, DeviceID: ent.DeviceID, Entity: ent})
+		} else {
+			r.publishLifecycle(types.SubjectEntityCreated, types.BatchEntityItem{PluginID: r.manifest.ID, DeviceID: ent.DeviceID, Entity: ent})
+		}
+		if dev, ok := r.reg.LoadDevice(ent.DeviceID); ok {
+			_ = r.reg.SaveDevice(dev)
+			r.publishLifecycle(types.SubjectDeviceUpdated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
+		} else if strings.TrimSpace(ent.DeviceID) != "" {
+			dev := types.Device{ID: ent.DeviceID, SourceID: ent.DeviceID, LocalName: ent.DeviceID}
+			_ = r.reg.SaveDevice(dev)
+			r.publishLifecycle(types.SubjectDeviceCreated, types.BatchDeviceItem{PluginID: r.manifest.ID, Device: dev})
+		}
+		result = ent
 
-	case "entities/update":
+	case types.RPCMethodEntitiesUpdate:
 		var incoming types.Entity
 		if err := json.Unmarshal(req.Params, &incoming); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
@@ -469,8 +438,8 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 		// Merge with persisted data so source fields (domain, actions) and the
 		// user field (local_name) never overwrite each other.
-		ent := r.loadEntity(incoming.DeviceID, incoming.ID)
-		if ent.ID == "" {
+		ent, ok := r.reg.LoadEntity(incoming.DeviceID, incoming.ID)
+		if !ok {
 			ent = incoming
 		} else {
 			if incoming.LocalName != "" {
@@ -486,16 +455,18 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 				ent.Labels = incoming.Labels
 			}
 		}
-		updated, err := r.plugin.OnEntityUpdate(ent)
-		if err != nil {
+		if err := r.reg.SaveEntity(ent); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.saveEntity(updated)
-			r.refreshAllDynamicQueries()
-			result = updated
+			break
 		}
+		if ok {
+			r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{PluginID: r.manifest.ID, DeviceID: ent.DeviceID, Entity: ent})
+		} else {
+			r.publishLifecycle(types.SubjectEntityCreated, types.BatchEntityItem{PluginID: r.manifest.ID, DeviceID: ent.DeviceID, Entity: ent})
+		}
+		result = ent
 
-	case "entities/delete":
+	case types.RPCMethodEntitiesDelete:
 		var params struct {
 			DeviceID string `json:"device_id"`
 			EntityID string `json:"entity_id"`
@@ -504,15 +475,14 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		if err := r.plugin.OnEntityDelete(params.DeviceID, params.EntityID); err != nil {
+		if err := r.reg.DeleteEntity(params.DeviceID, params.EntityID); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			r.deleteEntity(params.DeviceID, params.EntityID)
-			r.refreshAllDynamicQueries()
-			result = true
+			break
 		}
+		r.publishLifecycle(types.SubjectEntityDeleted, types.BatchEntityRef{PluginID: r.manifest.ID, DeviceID: params.DeviceID, EntityID: params.EntityID})
+		result = true
 
-	case "entities/list":
+	case types.RPCMethodEntitiesList:
 		var params struct {
 			DeviceID string `json:"device_id"`
 		}
@@ -520,29 +490,15 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		current := r.loadEntities(params.DeviceID)
-		discovered, err := r.plugin.OnEntityDiscover(params.DeviceID, current)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			merged := ReconcileEntitiesAdditive(current, discovered, params.DeviceID)
-			for _, ent := range merged {
-				if strings.TrimSpace(ent.ID) == "" {
-					continue
-				}
-				if strings.TrimSpace(ent.DeviceID) == "" {
-					ent.DeviceID = params.DeviceID
-				}
-				if strings.TrimSpace(ent.DeviceID) == "" {
-					continue
-				}
-				r.saveEntity(ent)
-			}
-			r.refreshAllDynamicQueries()
-			result = merged
-		}
+		entities := r.reg.LoadEntities(params.DeviceID)
+		r.publishLifecycle(types.SubjectEntityRead, types.BatchEntityRead{
+			PluginID: r.manifest.ID,
+			DeviceID: params.DeviceID,
+			Count:    len(entities),
+		})
+		result = entities
 
-	case "entities/refresh":
+	case types.RPCMethodEntitiesRefresh:
 		var params struct {
 			DeviceID string `json:"device_id"`
 		}
@@ -550,31 +506,107 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		refreshed, err := r.refreshEntities(params.DeviceID)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = refreshed
+		entities := r.reg.LoadEntities(params.DeviceID)
+		for _, ent := range entities {
+			r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
+				PluginID: r.manifest.ID,
+				DeviceID: params.DeviceID,
+				Entity:   ent,
+			})
 		}
+		result = entities
 
-	case "entities/commands/create":
+	case types.RPCMethodSnapshotsSave:
 		var params struct {
-			DeviceID string          `json:"device_id"`
-			EntityID string          `json:"entity_id"`
-			Payload  json.RawMessage `json:"payload"`
+			DeviceID string              `json:"device_id"`
+			EntityID string              `json:"entity_id"`
+			Name     string              `json:"name"`
+			Labels   map[string][]string `json:"labels,omitempty"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		status, err := r.createCommand(params.DeviceID, params.EntityID, params.Payload)
+		snap, err := r.saveSnapshot(params.DeviceID, params.EntityID, params.Name, params.Labels)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snap
+		}
+
+	case types.RPCMethodSnapshotsList:
+		var params struct {
+			DeviceID string `json:"device_id"`
+			EntityID string `json:"entity_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snaps, err := r.listSnapshots(params.DeviceID, params.EntityID)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snaps
+		}
+
+	case types.RPCMethodSnapshotsDelete:
+		var params struct {
+			DeviceID   string `json:"device_id"`
+			EntityID   string `json:"entity_id"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snap, err := r.deleteSnapshot(params.DeviceID, params.EntityID, params.SnapshotID)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snap
+		}
+
+	case types.RPCMethodSnapshotsRestore:
+		var params struct {
+			DeviceID   string `json:"device_id"`
+			EntityID   string `json:"entity_id"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		snap, err := r.restoreSnapshot(params.DeviceID, params.EntityID, params.SnapshotID)
+		if err != nil {
+			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
+		} else {
+			result = snap
+		}
+
+	case types.RPCMethodCommandsCreate:
+		var params struct {
+			CommandID string          `json:"command_id"`
+			DeviceID  string          `json:"device_id"`
+			EntityID  string          `json:"entity_id"`
+			Payload   json.RawMessage `json:"payload"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
+			break
+		}
+		if strings.TrimSpace(params.CommandID) == "" {
+			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: command_id is required"}
+			break
+		}
+		status, err := r.createCommand(params.CommandID, params.DeviceID, params.EntityID, params.Payload)
 		if err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 		} else {
 			result = status
 		}
 
-	case "commands/status/get":
+	case types.RPCMethodCommandsStatusGet:
 		var params struct {
 			CommandID string `json:"command_id"`
 		}
@@ -589,7 +621,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			result = status
 		}
 
-	case "entities/events/ingest":
+	case types.RPCMethodEventsIngest:
 		var evt types.InboundEvent
 		if err := json.Unmarshal(req.Params, &evt); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
@@ -602,203 +634,6 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			result = updated
 		}
 
-	case "scripts/get":
-		var params struct {
-			DeviceID string `json:"device_id"`
-			EntityID string `json:"entity_id"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		source, path, err := r.ScriptGet(params.DeviceID, params.EntityID)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32004, Message: err.Error()}
-		} else {
-			result = map[string]any{
-				"plugin_id": r.manifest.ID,
-				"device_id": params.DeviceID,
-				"entity_id": params.EntityID,
-				"path":      path,
-				"source":    source,
-			}
-		}
-
-	case "scripts/put":
-		var params struct {
-			DeviceID string `json:"device_id"`
-			EntityID string `json:"entity_id"`
-			Source   string `json:"source"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		path, err := r.ScriptPut(params.DeviceID, params.EntityID, params.Source)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = map[string]any{
-				"plugin_id": r.manifest.ID,
-				"device_id": params.DeviceID,
-				"entity_id": params.EntityID,
-				"path":      path,
-				"source":    params.Source,
-			}
-		}
-
-	case "scripts/delete":
-		var params struct {
-			DeviceID   string `json:"device_id"`
-			EntityID   string `json:"entity_id"`
-			PurgeState bool   `json:"purge_state"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		err := r.ScriptDelete(params.DeviceID, params.EntityID, params.PurgeState)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = map[string]any{
-				"plugin_id":   r.manifest.ID,
-				"device_id":   params.DeviceID,
-				"entity_id":   params.EntityID,
-				"deleted":     true,
-				"state_purge": params.PurgeState,
-			}
-		}
-
-	case "scripts/state/get":
-		var params struct {
-			DeviceID string `json:"device_id"`
-			EntityID string `json:"entity_id"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		state, path := r.ScriptStateGet(params.DeviceID, params.EntityID)
-		result = map[string]any{
-			"plugin_id": r.manifest.ID,
-			"device_id": params.DeviceID,
-			"entity_id": params.EntityID,
-			"path":      path,
-			"state":     state,
-		}
-
-	case "scripts/state/put":
-		var params struct {
-			DeviceID string         `json:"device_id"`
-			EntityID string         `json:"entity_id"`
-			State    map[string]any `json:"state"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		path, err := r.ScriptStatePut(params.DeviceID, params.EntityID, params.State)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = map[string]any{
-				"plugin_id": r.manifest.ID,
-				"device_id": params.DeviceID,
-				"entity_id": params.EntityID,
-				"path":      path,
-				"state":     params.State,
-			}
-		}
-
-	case "scripts/state/delete":
-		var params struct {
-			DeviceID string `json:"device_id"`
-			EntityID string `json:"entity_id"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		path, err := r.ScriptStateDelete(params.DeviceID, params.EntityID)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = map[string]any{
-				"plugin_id": r.manifest.ID,
-				"device_id": params.DeviceID,
-				"entity_id": params.EntityID,
-				"path":      path,
-				"state":     map[string]any{},
-			}
-		}
-
-	case "entities/snapshots/save":
-		var params struct {
-			DeviceID string              `json:"device_id"`
-			EntityID string              `json:"entity_id"`
-			Name     string              `json:"name"`
-			Labels   map[string][]string `json:"labels,omitempty"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		snap, err := r.CreateSnapshot(params.DeviceID, params.EntityID, params.Name, params.Labels)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = snap
-		}
-
-	case "entities/snapshots/list":
-		var params struct {
-			DeviceID string `json:"device_id"`
-			EntityID string `json:"entity_id"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		snaps, err := r.ListSnapshots(params.DeviceID, params.EntityID)
-		if err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = snaps
-		}
-
-	case "entities/snapshots/delete":
-		var params struct {
-			DeviceID   string `json:"device_id"`
-			EntityID   string `json:"entity_id"`
-			SnapshotID string `json:"snapshot_id"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		if err := r.DeleteSnapshot(params.DeviceID, params.EntityID, params.SnapshotID); err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = true
-		}
-
-	case "entities/snapshots/restore":
-		var params struct {
-			DeviceID   string `json:"device_id"`
-			EntityID   string `json:"entity_id"`
-			SnapshotID string `json:"snapshot_id"`
-		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
-			break
-		}
-		if err := r.RestoreSnapshot(params.DeviceID, params.EntityID, params.SnapshotID); err != nil {
-			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
-		} else {
-			result = true
-		}
-
 	default:
 		rpcErr = &types.RPCError{Code: -32601, Message: "method not found"}
 	}
@@ -806,7 +641,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 	r.sendResponse(m, req.ID, result, rpcErr)
 }
 
-func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessage) (types.CommandStatus, error) {
+func (r *Runner) createCommand(commandID, deviceID, entityID string, payload json.RawMessage) (types.CommandStatus, error) {
 	cmdStart := time.Now()
 	if r.logger != nil {
 		r.logger.Log(context.Background(), LevelTrace, "create_command start",
@@ -821,7 +656,10 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 			"entity_id", entityID,
 			"start_unix_ms", resolveStart.UnixMilli())
 	}
-	ent := r.resolveEntity(deviceID, entityID)
+	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	if !ok {
+		ent = types.Entity{}
+	}
 	if r.logger != nil {
 		r.logger.Log(context.Background(), LevelTrace, "create_command resolve_entity done",
 			"device_id", deviceID,
@@ -834,7 +672,7 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 
 	now := time.Now().UTC()
 	cmd := types.Command{
-		ID:         nextID("cmd"),
+		ID:         commandID,
 		PluginID:   r.manifest.ID,
 		DeviceID:   deviceID,
 		EntityID:   entityID,
@@ -866,7 +704,8 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 			"entity_id", entityID,
 			"start_unix_ms", onCommandStart.UnixMilli())
 	}
-	updated, err := r.plugin.OnCommand(cmd, ent)
+	err := r.plugin.OnCommand(cmd, ent)
+	updated := ent
 	if r.logger != nil {
 		r.logger.Log(context.Background(), LevelTrace, "create_command on_command done",
 			"command_id", cmd.ID,
@@ -885,7 +724,12 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 		entCopy := ent
 		go func() {
 			persistStart := time.Now()
-			r.saveEntity(entCopy)
+			_ = r.reg.SaveEntity(entCopy)
+			r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
+				PluginID: r.manifest.ID,
+				DeviceID: entCopy.DeviceID,
+				Entity:   entCopy,
+			})
 			if r.logger != nil {
 				r.logger.Log(context.Background(), LevelTrace, "create_command persist failed_entity",
 					"command_id", cmd.ID,
@@ -906,7 +750,12 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 	updatedCopy := updated
 	go func() {
 		persistStart := time.Now()
-		r.saveEntity(updatedCopy)
+		_ = r.reg.SaveEntity(updatedCopy)
+		r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
+			PluginID: r.manifest.ID,
+			DeviceID: updatedCopy.DeviceID,
+			Entity:   updatedCopy,
+		})
 		if r.logger != nil {
 			r.logger.Log(context.Background(), LevelTrace, "create_command persist ok",
 				"command_id", cmd.ID,
@@ -916,15 +765,24 @@ func (r *Runner) createCommand(deviceID, entityID string, payload json.RawMessag
 				"total_elapsed_ms", time.Since(cmdStart).Milliseconds())
 		}
 	}()
-	go r.handleCommand(cmd)
 	return status, nil
 }
 
-// EmitEvent satisfies EventSink, letting plugin code publish provider-originated
-// events back into the system after completing last-mile work.
-func (r *Runner) EmitEvent(evt types.InboundEvent) error {
+func (r *Runner) PublishEvent(evt types.InboundEvent) error {
 	_, err := r.processInboundEvent(evt)
 	return err
+}
+
+func (r *Runner) SendCommand(req types.Command) error {
+	if r.nc == nil {
+		return fmt.Errorf("nats not connected")
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	subj := types.SubjectRPCPrefix + req.PluginID + ".command"
+	return r.nc.Publish(subj, data)
 }
 
 func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, error) {
@@ -932,7 +790,10 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 		return types.Entity{}, err
 	}
 
-	ent := r.resolveEntity(evt.DeviceID, evt.EntityID)
+	ent, ok := r.reg.LoadEntity(evt.DeviceID, evt.EntityID)
+	if !ok {
+		ent = types.Entity{}
+	}
 	if ent.ID == "" {
 		return types.Entity{}, fmt.Errorf("entity not found")
 	}
@@ -946,18 +807,12 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 		Payload:       evt.Payload,
 		CreatedAt:     time.Now().UTC(),
 	}
-	updated, err := r.plugin.OnEvent(event, ent)
-	if err != nil {
-		// Plugin couldn't process the event (e.g. unsupported domain), but the
-		// event was received. Apply the raw payload so state is up to date.
-		if r.logger != nil {
-			r.logger.Warn("plugin OnEvent error; applying raw payload", "plugin", r.manifest.ID, "device", evt.DeviceID, "entity", evt.EntityID, "error", err.Error())
-		}
-		updated = ent
-		updated.Data.Reported = evt.Payload
-		updated.Data.Effective = evt.Payload
-		updated.Data.SyncStatus = types.SyncStatusSynced
-	}
+
+	// Plugins no longer handle events via OnEvent, the runner directly updates the canonical state.
+	updated := ent
+	updated.Data.Reported = evt.Payload
+	updated.Data.Effective = evt.Payload
+	updated.Data.SyncStatus = types.SyncStatusSynced
 	updated.Data.LastEventID = event.ID
 	if event.CorrelationID != "" {
 		if status, ok := r.getCommandStatus(event.CorrelationID); ok {
@@ -972,7 +827,12 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	}
 	updated.Data.SyncStatus = types.NormalizeSyncStatus(updated.Data.SyncStatus)
 	updated.Data.UpdatedAt = time.Now().UTC()
-	r.saveEntity(updated)
+	_ = r.reg.SaveEntity(updated)
+	r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
+		PluginID: r.manifest.ID,
+		DeviceID: updated.DeviceID,
+		Entity:   updated,
+	})
 
 	envelopePayload, err := json.Marshal(event.Payload)
 	if err != nil {
@@ -991,12 +851,10 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	if data, err := json.Marshal(envelope); err != nil {
 		log.Printf("plugin-runner: failed to marshal event envelope: %v", err)
 	} else if r.nc != nil {
-		if err := r.nc.Publish(SubjectEntityEvents, data); err != nil {
+		if err := r.nc.Publish(types.SubjectEntityEvents, data); err != nil {
 			log.Printf("plugin-runner: failed to publish entity event: %v", err)
 		}
 	}
-	go r.handleEvent(envelope)
-
 	return updated, nil
 }
 
@@ -1014,6 +872,89 @@ func requiredEventType(payload json.RawMessage) (string, error) {
 	return t, nil
 }
 
+func (r *Runner) saveSnapshot(deviceID, entityID, name string, labels map[string][]string) (types.EntitySnapshot, error) {
+	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	if !ok || ent.ID == "" {
+		return types.EntitySnapshot{}, fmt.Errorf("entity not found")
+	}
+	state := ent.Data.Effective
+	if len(state) == 0 {
+		state = json.RawMessage(`{}`)
+	}
+	snap := types.EntitySnapshot{
+		ID:        nextID("snap"),
+		Name:      name,
+		State:     append(json.RawMessage(nil), state...),
+		Labels:    labels,
+		CreatedAt: time.Now().UTC(),
+	}
+	if ent.Snapshots == nil {
+		ent.Snapshots = make(map[string]types.EntitySnapshot)
+	}
+	ent.Snapshots[snap.ID] = snap
+	if err := r.reg.SaveEntity(ent); err != nil {
+		return types.EntitySnapshot{}, err
+	}
+	r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
+		PluginID: r.manifest.ID,
+		DeviceID: ent.DeviceID,
+		Entity:   ent,
+	})
+	return snap, nil
+}
+
+func (r *Runner) listSnapshots(deviceID, entityID string) ([]types.EntitySnapshot, error) {
+	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	if !ok || ent.ID == "" {
+		return nil, fmt.Errorf("entity not found")
+	}
+	out := make([]types.EntitySnapshot, 0, len(ent.Snapshots))
+	for _, snap := range ent.Snapshots {
+		out = append(out, snap)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (r *Runner) deleteSnapshot(deviceID, entityID, snapshotID string) (types.EntitySnapshot, error) {
+	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	if !ok || ent.ID == "" {
+		return types.EntitySnapshot{}, fmt.Errorf("entity not found")
+	}
+	snap, ok := ent.Snapshots[snapshotID]
+	if !ok {
+		return types.EntitySnapshot{}, fmt.Errorf("snapshot not found")
+	}
+	delete(ent.Snapshots, snapshotID)
+	if len(ent.Snapshots) == 0 {
+		ent.Snapshots = nil
+	}
+	if err := r.reg.SaveEntity(ent); err != nil {
+		return types.EntitySnapshot{}, err
+	}
+	r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
+		PluginID: r.manifest.ID,
+		DeviceID: ent.DeviceID,
+		Entity:   ent,
+	})
+	return snap, nil
+}
+
+func (r *Runner) restoreSnapshot(deviceID, entityID, snapshotID string) (types.EntitySnapshot, error) {
+	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	if !ok || ent.ID == "" {
+		return types.EntitySnapshot{}, fmt.Errorf("entity not found")
+	}
+	snap, ok := ent.Snapshots[snapshotID]
+	if !ok {
+		return types.EntitySnapshot{}, fmt.Errorf("snapshot not found")
+	}
+	if _, err := r.createCommand(nextID("gcmd"), deviceID, entityID, append(json.RawMessage(nil), snap.State...)); err != nil {
+		return types.EntitySnapshot{}, err
+	}
+	return snap, nil
+}
+
 func (r *Runner) handleRegistration(m *nats.Msg) {
 	var reg types.Registration
 	if err := json.Unmarshal(m.Data, &reg); err != nil {
@@ -1026,21 +967,6 @@ func (r *Runner) handleRegistration(m *nats.Msg) {
 	for _, schema := range reg.Manifest.Schemas {
 		types.RegisterDomain(schema)
 	}
-
-	r.registryMu.Lock()
-	r.registry[reg.Manifest.ID] = reg
-	r.registryMu.Unlock()
-}
-
-func (r *Runner) handleEntityEvent(m *nats.Msg) {
-	var env types.EntityEventEnvelope
-	if err := json.Unmarshal(m.Data, &env); err != nil {
-		return
-	}
-	if env.PluginID == r.manifest.ID {
-		return
-	}
-	r.handleEvent(env)
 }
 
 func (r *Runner) getCommandStatus(id string) (types.CommandStatus, bool) {
@@ -1056,7 +982,7 @@ func (r *Runner) setCommandStatus(status types.CommandStatus) {
 	r.statusMu.Unlock()
 	if r.nc != nil {
 		if data, err := json.Marshal(status); err == nil {
-			r.nc.Publish(SubjectCommandStatus, data)
+			r.nc.Publish(types.SubjectCommandStatus, data)
 		}
 	}
 }
@@ -1101,477 +1027,6 @@ func (r *Runner) handlePluginSearch(m *nats.Msg) {
 	}
 }
 
-func (r *Runner) handleDeviceSearch(m *nats.Msg) {
-	var q types.SearchQuery
-	if err := json.Unmarshal(m.Data, &q); err != nil {
-		return
-	}
-	if q.PluginID != "" && q.PluginID != r.manifest.ID {
-		return
-	}
-	matches := r.searchDevicesLocal(q)
-	if matches == nil {
-		matches = []types.Device{}
-	}
-	res := types.SearchDevicesResponse{
-		PluginID: r.manifest.ID,
-		Matches:  matches,
-	}
-	data, err := json.Marshal(res)
-	if err != nil {
-		log.Printf("plugin-runner: failed to marshal device search results: %v", err)
-		return
-	}
-	if err := m.Respond(data); err != nil {
-		log.Printf("plugin-runner: failed to respond to device search: %v", err)
-	}
-}
-
-func (r *Runner) handleEntitySearch(m *nats.Msg) {
-	var q types.SearchQuery
-	if err := json.Unmarshal(m.Data, &q); err != nil {
-		return
-	}
-	if q.PluginID != "" && q.PluginID != r.manifest.ID {
-		return
-	}
-	matches := r.searchEntitiesLocal(q)
-	if matches == nil {
-		matches = []types.Entity{}
-	}
-	res := types.SearchEntitiesResponse{
-		PluginID: r.manifest.ID,
-		Matches:  matches,
-	}
-	data, err := json.Marshal(res)
-	if err != nil {
-		log.Printf("plugin-runner: failed to marshal entity search results: %v", err)
-		return
-	}
-	if err := m.Respond(data); err != nil {
-		log.Printf("plugin-runner: failed to respond to entity search: %v", err)
-	}
-}
-
-func matchesLabels(have, want map[string][]string) bool {
-	if len(want) == 0 {
-		return true
-	}
-	if have == nil {
-		return false
-	}
-	for k, wantVals := range want {
-		haveVals := have[k]
-		matched := false
-		for _, w := range wantVals {
-			for _, h := range haveVals {
-				if h == w {
-					matched = true
-					break
-				}
-			}
-			if matched {
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	return true
-}
-
-func (r *Runner) searchDevicesLocal(q types.SearchQuery) []types.Device {
-	var matches []types.Device
-	qLower := strings.ToLower(q.Pattern)
-	for _, d := range r.loadDevices() {
-		if q.PluginID != "" && q.PluginID != r.manifest.ID {
-			break
-		}
-		if q.DeviceID != "" && q.DeviceID != d.ID {
-			continue
-		}
-		if !matchesLabels(d.Labels, q.Labels) {
-			continue
-		}
-
-		if qLower != "" && qLower != "*" {
-			matched := false
-			if strings.Contains(strings.ToLower(d.ID), qLower) ||
-				strings.Contains(strings.ToLower(d.SourceID), qLower) ||
-				strings.Contains(strings.ToLower(d.SourceName), qLower) ||
-				strings.Contains(strings.ToLower(d.LocalName), qLower) {
-				matched = true
-			}
-			if !matched {
-				for _, vals := range d.Labels {
-					for _, v := range vals {
-						if strings.Contains(strings.ToLower(v), qLower) {
-							matched = true
-							break
-						}
-					}
-					if matched {
-						break
-					}
-				}
-			}
-			if !matched {
-				continue
-			}
-		} else if q.Pattern != "" {
-			if ok, _ := filepath.Match(q.Pattern, d.ID); !ok {
-				continue
-			}
-		}
-
-		matches = append(matches, d)
-	}
-	return applyDeviceLimit(matches, q.Limit)
-}
-
-func (r *Runner) searchEntitiesLocal(q types.SearchQuery) []types.Entity {
-	var matches []types.Entity
-	qLower := strings.ToLower(q.Pattern)
-	for _, d := range r.loadDevices() {
-		if q.PluginID != "" && q.PluginID != r.manifest.ID {
-			break
-		}
-		if q.DeviceID != "" && q.DeviceID != d.ID {
-			continue
-		}
-		for _, e := range r.loadEntities(d.ID) {
-			if q.EntityID != "" && q.EntityID != e.ID {
-				continue
-			}
-			if q.Domain != "" && q.Domain != e.Domain {
-				continue
-			}
-			if !matchesLabels(e.Labels, q.Labels) {
-				continue
-			}
-
-			if qLower != "" && qLower != "*" {
-				matched := false
-				if strings.Contains(strings.ToLower(e.ID), qLower) ||
-					strings.Contains(strings.ToLower(e.SourceID), qLower) ||
-					strings.Contains(strings.ToLower(e.SourceName), qLower) ||
-					strings.Contains(strings.ToLower(e.LocalName), qLower) {
-					matched = true
-				}
-				if !matched {
-					for _, vals := range e.Labels {
-						for _, v := range vals {
-							if strings.Contains(strings.ToLower(v), qLower) {
-								matched = true
-								break
-							}
-						}
-						if matched {
-							break
-						}
-					}
-				}
-				if !matched {
-					continue
-				}
-			} else if q.Pattern != "" {
-				if ok, _ := filepath.Match(q.Pattern, e.ID); !ok {
-					continue
-				}
-			}
-
-			matches = append(matches, e)
-		}
-	}
-	return applyEntityLimit(matches, q.Limit)
-}
-
-func applyDeviceLimit(items []types.Device, limit int) []types.Device {
-	if limit <= 0 || len(items) <= limit {
-		return items
-	}
-	return items[:limit]
-}
-
-func applyEntityLimit(items []types.Entity, limit int) []types.Entity {
-	if limit <= 0 || len(items) <= limit {
-		return items
-	}
-	return items[:limit]
-}
-
-func (r *Runner) snapshotRegistry() map[string]types.Registration {
-	r.registryMu.RLock()
-	defer r.registryMu.RUnlock()
-	out := make(map[string]types.Registration, len(r.registry))
-	for k, v := range r.registry {
-		out[k] = v
-	}
-	return out
-}
-
-func (r *Runner) callRPC(pluginID, method string, params any, timeout time.Duration) (types.Response, error) {
-	r.registryMu.RLock()
-	reg, ok := r.registry[pluginID]
-	r.registryMu.RUnlock()
-	if !ok {
-		return types.Response{}, fmt.Errorf("plugin not registered: %s", pluginID)
-	}
-
-	start := time.Now()
-	paramsBytes, _ := json.Marshal(params)
-	id := json.RawMessage(`1`)
-	req := types.Request{JSONRPC: types.JSONRPCVersion, ID: &id, Method: method, Params: paramsBytes}
-	data, _ := json.Marshal(req)
-	if r.logger != nil {
-		r.logger.Log(context.Background(), LevelTrace, "rpc request",
-			"plugin_id", pluginID,
-			"method", method,
-			"timeout_ms", timeout.Milliseconds(),
-			"start_unix_ms", start.UnixMilli())
-	}
-	msg, err := r.nc.Request(reg.RPCSubject, data, timeout)
-	if err != nil {
-		if r.logger != nil {
-			r.logger.Log(context.Background(), LevelTrace, "rpc request failed",
-				"plugin_id", pluginID,
-				"method", method,
-				"error", err.Error(),
-				"elapsed_ms", time.Since(start).Milliseconds())
-		}
-		return types.Response{}, err
-	}
-	var resp types.Response
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		if r.logger != nil {
-			r.logger.Log(context.Background(), LevelTrace, "rpc response unmarshal failed",
-				"plugin_id", pluginID,
-				"method", method,
-				"error", err.Error(),
-				"elapsed_ms", time.Since(start).Milliseconds())
-		}
-		return types.Response{}, err
-	}
-	if resp.Error != nil {
-		if r.logger != nil {
-			r.logger.Log(context.Background(), LevelTrace, "rpc response error",
-				"plugin_id", pluginID,
-				"method", method,
-				"error", resp.Error.Message,
-				"elapsed_ms", time.Since(start).Milliseconds())
-		}
-		return resp, fmt.Errorf("%s", resp.Error.Message)
-	}
-	if r.logger != nil {
-		fields := []any{
-			"plugin_id", pluginID,
-			"method", method,
-			"elapsed_ms", time.Since(start).Milliseconds(),
-		}
-		if method == "entities/commands/create" {
-			var status types.CommandStatus
-			if err := json.Unmarshal(resp.Result, &status); err == nil && strings.TrimSpace(status.CommandID) != "" {
-				fields = append(fields,
-					"command_id", status.CommandID,
-					"command_state", string(status.State),
-					"target_device_id", status.DeviceID,
-					"target_entity_id", status.EntityID)
-			}
-		}
-		r.logger.Log(context.Background(), LevelTrace, "rpc response ok", fields...)
-	}
-	return resp, nil
-}
-
-func (r *Runner) callListDevices(pluginID string) ([]types.Device, error) {
-	resp, err := r.callRPC(pluginID, "devices/list", nil, 1200*time.Millisecond)
-	if err != nil {
-		return nil, err
-	}
-	var out []types.Device
-	if err := json.Unmarshal(resp.Result, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (r *Runner) callListEntities(pluginID, deviceID string) ([]types.Entity, error) {
-	resp, err := r.callRPC(pluginID, "entities/list", map[string]any{"device_id": deviceID}, 1200*time.Millisecond)
-	if err != nil {
-		return nil, err
-	}
-	var out []types.Entity
-	if err := json.Unmarshal(resp.Result, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (r *Runner) callCreateCommand(pluginID, deviceID, entityID string, payload json.RawMessage) (types.CommandStatus, error) {
-	resp, err := r.callRPC(pluginID, "entities/commands/create", map[string]any{
-		"device_id": deviceID,
-		"entity_id": entityID,
-		"payload":   payload,
-	}, 1500*time.Millisecond)
-	if err != nil {
-		return types.CommandStatus{}, err
-	}
-	var out types.CommandStatus
-	if err := json.Unmarshal(resp.Result, &out); err != nil {
-		return types.CommandStatus{}, err
-	}
-	return out, nil
-}
-
-func (r *Runner) refreshDevices() ([]types.Device, error) {
-	current := r.loadDevices()
-	discovered, err := r.plugin.OnDeviceDiscover(current)
-	if err != nil {
-		return nil, err
-	}
-	merged := ReconcileDevicesAdditive(current, discovered)
-	for _, dev := range merged {
-		if strings.TrimSpace(dev.ID) == "" {
-			continue
-		}
-		r.saveDevice(dev)
-		if _, err := r.refreshEntities(dev.ID); err != nil {
-			return nil, err
-		}
-	}
-	return merged, nil
-}
-
-func (r *Runner) bootstrapStartupTopology() error {
-	current := r.loadDevices()
-	discovered, err := r.plugin.OnDeviceDiscover(current)
-	if err != nil {
-		return err
-	}
-	merged := ReconcileDevicesAdditive(current, discovered)
-	for _, dev := range merged {
-		if strings.TrimSpace(dev.ID) == "" {
-			continue
-		}
-		r.saveDevice(dev)
-	}
-	for _, dev := range merged {
-		if strings.TrimSpace(dev.ID) == "" {
-			continue
-		}
-		if _, err := r.refreshEntities(dev.ID); err != nil {
-			return fmt.Errorf("entities hydrate failed for device %s: %w", dev.ID, err)
-		}
-	}
-	return nil
-}
-
-func (r *Runner) refreshEntities(deviceID string) ([]types.Entity, error) {
-	current := r.loadEntities(deviceID)
-	discovered, err := r.plugin.OnEntityDiscover(deviceID, current)
-	if err != nil {
-		return nil, err
-	}
-	merged := ReconcileEntitiesAdditive(current, discovered, deviceID)
-	for _, ent := range merged {
-		if strings.TrimSpace(ent.ID) == "" {
-			continue
-		}
-		if strings.TrimSpace(ent.DeviceID) == "" {
-			ent.DeviceID = deviceID
-		}
-		if strings.TrimSpace(ent.DeviceID) == "" {
-			continue
-		}
-		r.saveEntity(ent)
-	}
-	return merged, nil
-}
-
-func (r *Runner) createDeviceWithFallback(dev types.Device) (types.Device, error) {
-	input := dev
-	if strings.TrimSpace(input.ID) == "" {
-		input.ID = strings.TrimSpace(input.SourceID)
-	}
-	if strings.TrimSpace(input.SourceID) == "" {
-		input.SourceID = input.ID
-	}
-	if input.LocalName == "" {
-		input.LocalName = input.Name()
-	}
-
-	created, err := r.plugin.OnDeviceCreate(input)
-	if err != nil {
-		if r.logger != nil {
-			r.logger.Warn("devices/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.ID, "error", err.Error())
-		}
-		return input, err
-	}
-
-	if strings.TrimSpace(created.ID) == "" {
-		created.ID = input.ID
-	}
-	if strings.TrimSpace(created.SourceID) == "" {
-		created.SourceID = input.SourceID
-	}
-	if created.LocalName == "" {
-		created.LocalName = created.Name()
-	}
-	return created, nil
-}
-
-func (r *Runner) createEntityWithFallback(ent types.Entity) (types.Entity, error) {
-	input := ent
-	if strings.TrimSpace(input.ID) == "" {
-		input.ID = strings.TrimSpace(input.SourceID)
-	}
-	if strings.TrimSpace(input.SourceID) == "" {
-		input.SourceID = input.ID
-	}
-	if input.LocalName == "" {
-		if input.SourceName != "" {
-			input.LocalName = input.SourceName
-		} else {
-			input.LocalName = input.ID
-		}
-	}
-	if input.Data.SyncStatus == types.SyncStatusEmpty {
-		input.Data.SyncStatus = types.SyncStatusSynced
-	}
-	if input.Data.UpdatedAt.IsZero() {
-		input.Data.UpdatedAt = time.Now().UTC()
-	}
-
-	created, err := r.plugin.OnEntityCreate(input)
-	if err != nil {
-		if r.logger != nil {
-			r.logger.Warn("entities/create plugin rejected; using synthetic fallback", "plugin", r.manifest.ID, "device_id", input.DeviceID, "entity_id", input.ID, "error", err.Error())
-		}
-		return input, err
-	}
-
-	if strings.TrimSpace(created.ID) == "" {
-		created.ID = input.ID
-	}
-	if strings.TrimSpace(created.SourceID) == "" {
-		created.SourceID = input.SourceID
-	}
-	if strings.TrimSpace(created.DeviceID) == "" {
-		created.DeviceID = input.DeviceID
-	}
-	if created.LocalName == "" {
-		created.LocalName = input.LocalName
-	}
-	if created.Data.SyncStatus == types.SyncStatusEmpty {
-		created.Data.SyncStatus = input.Data.SyncStatus
-	}
-	if created.Data.UpdatedAt.IsZero() {
-		created.Data.UpdatedAt = input.Data.UpdatedAt
-	}
-	return created, nil
-}
-
 func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcErr *types.RPCError) {
 	var resBytes json.RawMessage
 	if result != nil {
@@ -1597,7 +1052,7 @@ func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcE
 	}
 }
 
-// --- File persistence & Lifecycle ---
+// --- Lifecycle ---
 
 func (r *Runner) publishLifecycle(subject string, payload any) {
 	if r.nc == nil {
@@ -1611,264 +1066,4 @@ func (r *Runner) publishLifecycle(subject string, payload any) {
 	if err := r.nc.Publish(subject, data); err != nil {
 		log.Printf("plugin-runner: failed to publish lifecycle event %s: %v", subject, err)
 	}
-}
-
-func (r *Runner) saveDevice(dev types.Device) {
-	_ = r.ensureStateStore().SaveDevice(dev)
-	if r.snapshotStore != nil {
-		_ = r.snapshotStore.SaveDevice(dev)
-	}
-	r.publishLifecycle(SubjectDeviceUpdated, types.BatchDeviceItem{
-		PluginID: r.manifest.ID,
-		Device:   dev,
-	})
-}
-
-func (r *Runner) deleteDevice(id string) {
-	_ = r.ensureStateStore().DeleteDevice(id)
-	if r.snapshotStore != nil {
-		_ = r.snapshotStore.DeleteDevice(id)
-	}
-	r.publishLifecycle(SubjectDeviceDeleted, types.BatchDeviceRef{
-		PluginID: r.manifest.ID,
-		DeviceID: id,
-	})
-}
-
-func (r *Runner) deleteEntity(deviceID, entityID string) {
-	_ = r.ensureStateStore().DeleteEntity(deviceID, entityID)
-	if r.snapshotStore != nil {
-		_ = r.snapshotStore.DeleteEntity(deviceID, entityID)
-	}
-	r.publishLifecycle(SubjectEntityDeleted, types.BatchEntityRef{
-		PluginID: r.manifest.ID,
-		DeviceID: deviceID,
-		EntityID: entityID,
-	})
-}
-
-func (r *Runner) loadDevices() []types.Device {
-	items, err := r.ensureStateStore().LoadDevices()
-	if err != nil {
-		return nil
-	}
-	return items
-}
-
-func (r *Runner) loadDeviceByID(id string) types.Device {
-	dev, err := r.ensureStateStore().LoadDeviceByID(id)
-	if err != nil {
-		return types.Device{}
-	}
-	return dev
-}
-
-func (r *Runner) saveEntity(ent types.Entity) {
-	_ = r.ensureStateStore().SaveEntity(ent)
-	if r.snapshotStore != nil {
-		_ = r.snapshotStore.SaveEntity(ent)
-	}
-	r.publishLifecycle(SubjectEntityUpdated, types.BatchEntityItem{
-		PluginID: r.manifest.ID,
-		DeviceID: ent.DeviceID,
-		Entity:   ent,
-	})
-}
-
-func (r *Runner) loadEntity(deviceID, entityID string) types.Entity {
-	ent, err := r.ensureStateStore().LoadEntity(deviceID, entityID)
-	if err != nil {
-		return types.Entity{}
-	}
-	return ent
-}
-
-func (r *Runner) resolveEntity(deviceID, entityID string) types.Entity {
-	if ent := r.loadEntity(deviceID, entityID); ent.ID != "" {
-		return ent
-	}
-	list, err := r.plugin.OnEntityDiscover(deviceID, r.loadEntities(deviceID))
-	if err != nil {
-		return types.Entity{}
-	}
-	for _, e := range list {
-		if e.ID == entityID {
-			if e.DeviceID == "" {
-				e.DeviceID = deviceID
-			}
-			r.saveEntity(e)
-			return e
-		}
-	}
-	return types.Entity{}
-}
-
-func (r *Runner) loadEntities(deviceID string) []types.Entity {
-	items, err := r.ensureStateStore().LoadEntities(deviceID)
-	if err != nil {
-		return nil
-	}
-	return items
-}
-
-func (r *Runner) loadState(id string) types.Storage {
-	store, err := r.ensureStateStore().LoadState(id)
-	if err != nil {
-		return types.Storage{}
-	}
-	return store
-}
-
-func (r *Runner) saveStateSynced(id string, store types.Storage) {
-	_ = r.ensureStateStore().SaveState(id, store)
-}
-
-func (r *Runner) deviceLock(deviceID string) *sync.Mutex {
-	key := strings.TrimSpace(deviceID)
-	if key == "" {
-		key = "_global"
-	}
-	r.lockMu.Lock()
-	defer r.lockMu.Unlock()
-	if l, ok := r.deviceLocks[key]; ok {
-		return l
-	}
-	l := &sync.Mutex{}
-	r.deviceLocks[key] = l
-	return l
-}
-
-func (r *Runner) withDeviceLock(deviceID string, fn func()) {
-	l := r.deviceLock(deviceID)
-	l.Lock()
-	defer l.Unlock()
-	fn()
-}
-
-func hashBytes(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-func (r *Runner) getHash(path string) (string, bool) {
-	r.hashMu.RLock()
-	defer r.hashMu.RUnlock()
-	h, ok := r.fileHash[path]
-	return h, ok
-}
-
-func (r *Runner) setHash(path, hash string) {
-	r.hashMu.Lock()
-	r.fileHash[path] = hash
-	r.hashMu.Unlock()
-}
-
-func (r *Runner) clearHash(path string) {
-	r.hashMu.Lock()
-	delete(r.fileHash, path)
-	r.hashMu.Unlock()
-}
-
-func (r *Runner) seedHash(path string, data []byte) {
-	if len(data) == 0 {
-		return
-	}
-	if _, ok := r.getHash(path); ok {
-		return
-	}
-	r.setHash(path, hashBytes(data))
-}
-
-func (r *Runner) writeIfChanged(path string, data []byte) error {
-	start := time.Now()
-	newHash := hashBytes(data)
-	if oldHash, ok := r.getHash(path); ok && oldHash == newHash {
-		return nil
-	}
-
-	if oldHash, ok := r.getHash(path); !ok || oldHash != newHash {
-		if existing, err := os.ReadFile(path); err == nil {
-			existingHash := hashBytes(existing)
-			r.setHash(path, existingHash)
-			if existingHash == newHash {
-				return nil
-			}
-		}
-	}
-
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	syncStart := time.Now()
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if r.logger != nil {
-		r.logger.Log(context.Background(), LevelTrace, "write_if_changed fsync",
-			"path", path,
-			"sync_elapsed_ms", time.Since(syncStart).Milliseconds())
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	r.setHash(path, newHash)
-	if r.logger != nil {
-		r.logger.Log(context.Background(), LevelTrace, "write_if_changed done",
-			"path", path,
-			"total_elapsed_ms", time.Since(start).Milliseconds())
-	}
-	return nil
-}
-
-// --- RawStore implementation ---
-
-// ReadRawDevice reads protocol-specific raw data for a device.
-func (r *Runner) ReadRawDevice(deviceID string) (json.RawMessage, error) {
-	path := filepath.Join(r.dataDir, "raw", "devices", deviceID+".json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-// WriteRawDevice writes protocol-specific raw data for a device.
-func (r *Runner) WriteRawDevice(deviceID string, data json.RawMessage) error {
-	path := filepath.Join(r.dataDir, "raw", "devices", deviceID+".json")
-	return r.writeIfChanged(path, data)
-}
-
-// ReadRawEntity reads protocol-specific raw data for an entity.
-func (r *Runner) ReadRawEntity(deviceID, entityID string) (json.RawMessage, error) {
-	path := filepath.Join(r.dataDir, "raw", "devices", deviceID, "entities", entityID+".json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-// WriteRawEntity writes protocol-specific raw data for an entity.
-func (r *Runner) WriteRawEntity(deviceID, entityID string, data json.RawMessage) error {
-	path := filepath.Join(r.dataDir, "raw", "devices", deviceID, "entities", entityID+".json")
-	return r.writeIfChanged(path, data)
 }

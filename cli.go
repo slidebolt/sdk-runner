@@ -96,7 +96,7 @@ func newRunnerForCLI(newPlugin func() Plugin) (*Runner, error) {
 }
 
 func ensureDefaultDataDir() {
-	if strings.TrimSpace(os.Getenv(EnvPluginData)) != "" {
+	if strings.TrimSpace(os.Getenv(types.EnvPluginDataDir)) != "" {
 		return
 	}
 	exe, err := os.Executable()
@@ -107,7 +107,7 @@ func ensureDefaultDataDir() {
 			name = sanitizeName(base)
 		}
 	}
-	_ = os.Setenv(EnvPluginData, filepath.Join(".build", "data", name))
+	_ = os.Setenv(types.EnvPluginDataDir, filepath.Join(".build", "data", name))
 }
 
 func sanitizeName(s string) string {
@@ -134,29 +134,33 @@ func (r *Runner) RunDiscovery() error {
 func (r *Runner) RunDebugUI() error {
 	ui := newCLITheme()
 	_ = os.MkdirAll(r.dataDir, 0o755)
-	initialState := r.loadState("default")
-	var updatedState types.Storage
 	fmt.Println(ui.Step(1, "Plugin", "Initializing..."))
-	r.manifest, updatedState = r.plugin.OnInitialize(Config{DataDir: r.dataDir, EventSink: r, RawStore: r, Logger: r.logger}, initialState)
-	r.saveStateSynced("default", updatedState)
-	r.plugin.OnReady()
-	defer r.plugin.OnShutdown()
+	ctx := PluginContext{
+		Registry: r.reg,
+		Logger:   r.logger,
+		Events:   r,
+		Commands: r,
+	}
+	var err error
+	r.manifest, err = r.plugin.Initialize(ctx)
+	if err != nil {
+		fmt.Println(ui.Error(fmt.Sprintf("Initialization failed: %v", err)))
+		return err
+	}
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := r.plugin.WaitReady(waitCtx); err != nil {
-		log.Printf("plugin-runner: WaitReady failed in debug mode: %v; proceeding anyway", err)
+	if err := r.plugin.Start(waitCtx); err != nil {
+		log.Printf("plugin-runner: Start failed in debug mode: %v; proceeding anyway", err)
 	}
 	waitCancel()
+	defer r.plugin.Stop()
 
-	fmt.Println(ui.Step(2, "Discovery", "Refreshing devices/entities..."))
-	if _, err := r.refreshDevices(); err != nil {
-		log.Printf("%s initial refresh failed in debug mode: %v", ui.Warn("plugin-runner:"), err)
-	}
+	fmt.Println(ui.Step(2, "Registry", "Using in-memory registry state"))
 
 	fmt.Println(ui.Step(3, "Debug UI", "Ready"))
 	fmt.Printf("%s %s (%s)\n", ui.Info("plugin"), ui.Value(r.manifest.ID), ui.Value(r.manifest.Name))
 	fmt.Printf("%s %s\n", ui.Info("data"), ui.Value(r.dataDir))
-	fmt.Println(ui.Muted("commands: help, status, devices, entities <device_id>, refresh [device_id], command <device_id> <entity_id> <json>, event <device_id> <entity_id> <json> [correlation_id], quit"))
+	fmt.Println(ui.Muted("commands: help, status, devices, entities <device_id>, command <device_id> <entity_id> <json>, event <device_id> <entity_id> <json> [correlation_id], quit"))
 
 	sc := bufio.NewScanner(os.Stdin)
 	for {
@@ -189,20 +193,15 @@ func (r *Runner) handleDebugCommand(line string) error {
 		fmt.Println("status")
 		fmt.Println("devices")
 		fmt.Println("entities <device_id>")
-		fmt.Println("refresh [device_id]")
 		fmt.Println("command <device_id> <entity_id> <json>")
 		fmt.Println("event <device_id> <entity_id> <json> [correlation_id]")
 		fmt.Println("quit")
 		return nil
 	case "status":
-		health, err := r.plugin.OnHealthCheck()
-		if err != nil {
-			return err
-		}
-		fmt.Printf("%s %s\n", ui.Info("health:"), ui.Value(health))
+		fmt.Printf("%s %s\n", ui.Info("health:"), ui.Value("OK"))
 		return nil
 	case "devices":
-		data, _ := json.MarshalIndent(r.loadDevices(), "", "  ")
+		data, _ := json.MarshalIndent(r.reg.LoadDevices(), "", "  ")
 		fmt.Println(string(data))
 		return nil
 	case "entities":
@@ -210,24 +209,8 @@ func (r *Runner) handleDebugCommand(line string) error {
 		if deviceID == "" {
 			return fmt.Errorf("usage: entities <device_id>")
 		}
-		data, _ := json.MarshalIndent(r.loadEntities(deviceID), "", "  ")
+		data, _ := json.MarshalIndent(r.reg.LoadEntities(deviceID), "", "  ")
 		fmt.Println(string(data))
-		return nil
-	case "refresh":
-		deviceID := strings.TrimSpace(rest)
-		if deviceID == "" {
-			devices, err := r.refreshDevices()
-			if err != nil {
-				return err
-			}
-			fmt.Printf("%s %d\n", ui.Info("refreshed devices:"), len(devices))
-			return nil
-		}
-		entities, err := r.refreshEntities(deviceID)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("%s %d\n", ui.Info("refreshed entities:"), len(entities))
 		return nil
 	case "command":
 		deviceID, tail, ok := cutWord(rest)
@@ -242,7 +225,7 @@ func (r *Runner) handleDebugCommand(line string) error {
 		if !json.Valid(payload) {
 			return fmt.Errorf("command payload must be valid JSON")
 		}
-		status, err := r.createCommand(deviceID, entityID, payload)
+		status, err := r.createCommand(nextID("gcmd"), deviceID, entityID, payload)
 		if err != nil {
 			return err
 		}

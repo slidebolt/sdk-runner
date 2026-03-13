@@ -41,7 +41,7 @@ func resolveLogLevel(service string) slog.Level {
 }
 
 func logLevelKeys(service string) []string {
-	keys := make([]string, 0, 4)
+	keys := make([]string, 0, 6)
 	if normalized := normalizeLogKey(service); normalized != "" {
 		keys = append(keys, "PLUGIN_"+normalized+"_LOG_LEVEL")
 	}
