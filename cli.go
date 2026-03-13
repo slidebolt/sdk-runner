@@ -209,7 +209,7 @@ func (r *Runner) handleDebugCommand(line string) error {
 		if deviceID == "" {
 			return fmt.Errorf("usage: entities <device_id>")
 		}
-		data, _ := json.MarshalIndent(r.reg.LoadEntities(deviceID), "", "  ")
+		data, _ := json.MarshalIndent(r.reg.GetEntities(r.reg.Namespace(), deviceID), "", "  ")
 		fmt.Println(string(data))
 		return nil
 	case "command":

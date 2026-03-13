@@ -410,7 +410,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		_, existed := r.reg.LoadEntity(ent.DeviceID, ent.ID)
+		_, existed := r.reg.GetEntity(r.reg.Namespace(), ent.DeviceID, ent.ID)
 		if err := r.reg.SaveEntity(ent); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 			break
@@ -438,7 +438,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 		}
 		// Merge with persisted data so source fields (domain, actions) and the
 		// user field (local_name) never overwrite each other.
-		ent, ok := r.reg.LoadEntity(incoming.DeviceID, incoming.ID)
+		ent, ok := r.reg.GetEntity(r.reg.Namespace(), incoming.DeviceID, incoming.ID)
 		if !ok {
 			ent = incoming
 		} else {
@@ -475,7 +475,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		if err := r.reg.DeleteEntity(params.DeviceID, params.EntityID); err != nil {
+		if err := r.reg.DeleteEntity(r.reg.Namespace(), params.DeviceID, params.EntityID); err != nil {
 			rpcErr = &types.RPCError{Code: -32001, Message: err.Error()}
 			break
 		}
@@ -490,7 +490,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		entities := r.reg.LoadEntities(params.DeviceID)
+		entities := r.reg.GetEntities(r.reg.Namespace(), params.DeviceID)
 		r.publishLifecycle(types.SubjectEntityRead, types.BatchEntityRead{
 			PluginID: r.manifest.ID,
 			DeviceID: params.DeviceID,
@@ -506,7 +506,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
-		entities := r.reg.LoadEntities(params.DeviceID)
+		entities := r.reg.GetEntities(r.reg.Namespace(), params.DeviceID)
 		for _, ent := range entities {
 			r.publishLifecycle(types.SubjectEntityUpdated, types.BatchEntityItem{
 				PluginID: r.manifest.ID,
@@ -656,7 +656,7 @@ func (r *Runner) createCommand(commandID, deviceID, entityID string, payload jso
 			"entity_id", entityID,
 			"start_unix_ms", resolveStart.UnixMilli())
 	}
-	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	ent, ok := r.reg.GetEntity(r.reg.Namespace(), deviceID, entityID)
 	if !ok {
 		ent = types.Entity{}
 	}
@@ -790,7 +790,7 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 		return types.Entity{}, err
 	}
 
-	ent, ok := r.reg.LoadEntity(evt.DeviceID, evt.EntityID)
+	ent, ok := r.reg.GetEntity(r.reg.Namespace(), evt.DeviceID, evt.EntityID)
 	if !ok {
 		ent = types.Entity{}
 	}
@@ -873,7 +873,7 @@ func requiredEventType(payload json.RawMessage) (string, error) {
 }
 
 func (r *Runner) saveSnapshot(deviceID, entityID, name string, labels map[string][]string) (types.EntitySnapshot, error) {
-	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	ent, ok := r.reg.GetEntity(r.reg.Namespace(), deviceID, entityID)
 	if !ok || ent.ID == "" {
 		return types.EntitySnapshot{}, fmt.Errorf("entity not found")
 	}
@@ -904,7 +904,7 @@ func (r *Runner) saveSnapshot(deviceID, entityID, name string, labels map[string
 }
 
 func (r *Runner) listSnapshots(deviceID, entityID string) ([]types.EntitySnapshot, error) {
-	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	ent, ok := r.reg.GetEntity(r.reg.Namespace(), deviceID, entityID)
 	if !ok || ent.ID == "" {
 		return nil, fmt.Errorf("entity not found")
 	}
@@ -917,7 +917,7 @@ func (r *Runner) listSnapshots(deviceID, entityID string) ([]types.EntitySnapsho
 }
 
 func (r *Runner) deleteSnapshot(deviceID, entityID, snapshotID string) (types.EntitySnapshot, error) {
-	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	ent, ok := r.reg.GetEntity(r.reg.Namespace(), deviceID, entityID)
 	if !ok || ent.ID == "" {
 		return types.EntitySnapshot{}, fmt.Errorf("entity not found")
 	}
@@ -941,7 +941,7 @@ func (r *Runner) deleteSnapshot(deviceID, entityID, snapshotID string) (types.En
 }
 
 func (r *Runner) restoreSnapshot(deviceID, entityID, snapshotID string) (types.EntitySnapshot, error) {
-	ent, ok := r.reg.LoadEntity(deviceID, entityID)
+	ent, ok := r.reg.GetEntity(r.reg.Namespace(), deviceID, entityID)
 	if !ok || ent.ID == "" {
 		return types.EntitySnapshot{}, fmt.Errorf("entity not found")
 	}
