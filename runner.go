@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	regsvc "github.com/slidebolt/registry"
+	lightentity "github.com/slidebolt/sdk-entities/light"
+	switchentity "github.com/slidebolt/sdk-entities/switch"
 	"github.com/slidebolt/sdk-types"
 )
 
@@ -194,6 +197,7 @@ func (r *Runner) RunContext(ctx context.Context) error {
 	}
 
 	r.nc.Subscribe(r.rpcSubject, r.handleRPC)
+	r.nc.Subscribe(r.rpcSubject+".command", r.handleDirectCommand)
 	r.nc.Subscribe(types.SubjectSearchPlugins, r.handlePluginSearch)
 	r.nc.Subscribe(types.SubjectRegistration, r.handleRegistration)
 	r.nc.Subscribe(types.SubjectDiscoveryProbe, func(m *nats.Msg) {
@@ -333,7 +337,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case types.RPCMethodDevicesCreate:
 		var dev types.Device
-		if err := json.Unmarshal(req.Params, &dev); err != nil {
+		if err := strictDecode(req.Params, &dev); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
@@ -360,7 +364,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case types.RPCMethodDevicesUpdate:
 		var incoming types.Device
-		if err := json.Unmarshal(req.Params, &incoming); err != nil {
+		if err := strictDecode(req.Params, &incoming); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
@@ -421,7 +425,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case types.RPCMethodEntitiesCreate:
 		var ent types.Entity
-		if err := json.Unmarshal(req.Params, &ent); err != nil {
+		if err := strictDecode(req.Params, &ent); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
@@ -447,7 +451,7 @@ func (r *Runner) handleRPC(m *nats.Msg) {
 
 	case types.RPCMethodEntitiesUpdate:
 		var incoming types.Entity
-		if err := json.Unmarshal(req.Params, &incoming); err != nil {
+		if err := strictDecode(req.Params, &incoming); err != nil {
 			rpcErr = &types.RPCError{Code: -32700, Message: "invalid params: " + err.Error()}
 			break
 		}
@@ -772,6 +776,7 @@ func (r *Runner) createCommand(commandID, deviceID, entityID string, payload jso
 		r.logger.Log(context.Background(), LevelTrace, "create_command start",
 			"device_id", deviceID,
 			"entity_id", entityID,
+			"payload", string(payload),
 			"start_unix_ms", cmdStart.UnixMilli())
 	}
 	resolveStart := time.Now()
@@ -910,17 +915,30 @@ func (r *Runner) SendCommand(req types.Command) error {
 	return r.nc.Publish(subj, data)
 }
 
-func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, error) {
-	if _, err := requiredEventType(evt.Payload); err != nil {
-		return types.Entity{}, err
+// handleDirectCommand processes fire-and-forget command messages published
+// directly to this plugin's "<rpcSubject>.command" NATS subject. This enables
+// plugin-to-plugin command routing without going through the gateway HTTP layer.
+func (r *Runner) handleDirectCommand(m *nats.Msg) {
+	var cmd types.Command
+	if err := json.Unmarshal(m.Data, &cmd); err != nil {
+		log.Printf("plugin-runner: handleDirectCommand: unmarshal: %v", err)
+		return
 	}
+	if _, err := r.createCommand(cmd.ID, cmd.DeviceID, cmd.EntityID, cmd.Payload); err != nil {
+		log.Printf("plugin-runner: handleDirectCommand: createCommand entity=%s: %v", cmd.EntityID, err)
+	}
+}
 
+func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, error) {
 	ent, ok := r.reg.GetEntity(r.reg.Namespace(), evt.DeviceID, evt.EntityID)
 	if !ok {
 		ent = types.Entity{}
 	}
 	if ent.ID == "" {
 		return types.Entity{}, fmt.Errorf("entity not found")
+	}
+	if err := validateInboundPayload(ent.Domain, evt.Payload); err != nil {
+		return types.Entity{}, err
 	}
 	event := types.Event{
 		ID:            nextID("evt"),
@@ -983,18 +1001,81 @@ func (r *Runner) processInboundEvent(evt types.InboundEvent) (types.Entity, erro
 	return updated, nil
 }
 
-func requiredEventType(payload json.RawMessage) (string, error) {
+func validateInboundPayload(domain string, payload json.RawMessage) error {
+	switch domain {
+	case lightentity.Type:
+		return validateCanonicalLightStatePayload(payload)
+	case switchentity.Type:
+		return validateCanonicalSwitchStatePayload(payload)
+	default:
+		return nil
+	}
+}
+
+func validateCanonicalLightStatePayload(payload json.RawMessage) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return fmt.Errorf("light payload must be valid canonical state JSON: %w", err)
+	}
+	if _, ok := raw["type"]; ok {
+		return fmt.Errorf("light payload must be canonical state, not legacy event payload")
+	}
 	var probe struct {
-		Type string `json:"type"`
+		Power *bool `json:"power"`
 	}
 	if err := json.Unmarshal(payload, &probe); err != nil {
-		return "", fmt.Errorf("event payload must be valid JSON object with required field \"type\": %w", err)
+		return fmt.Errorf("light payload must decode as canonical state: %w", err)
 	}
-	t := strings.TrimSpace(probe.Type)
-	if t == "" {
-		return "", fmt.Errorf("event payload missing required field \"type\"")
+	if probe.Power == nil {
+		return fmt.Errorf("light payload missing required field \"power\"")
 	}
-	return t, nil
+	cmds, err := types.StateToCommands(lightentity.Type, payload)
+	if err != nil {
+		return fmt.Errorf("light payload is not valid canonical state: %w", err)
+	}
+	for _, cmdPayload := range cmds {
+		cmd, err := lightentity.ParseCommand(types.Command{Payload: cmdPayload})
+		if err != nil {
+			return fmt.Errorf("light payload is not valid canonical state: %w", err)
+		}
+		if err := lightentity.ValidateCommand(cmd); err != nil {
+			return fmt.Errorf("light payload is not valid canonical state: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateCanonicalSwitchStatePayload(payload json.RawMessage) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return fmt.Errorf("switch payload must be valid canonical state JSON: %w", err)
+	}
+	if _, ok := raw["type"]; ok {
+		return fmt.Errorf("switch payload must be canonical state, not legacy event payload")
+	}
+	var probe struct {
+		Power *bool `json:"power"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return fmt.Errorf("switch payload must decode as canonical state: %w", err)
+	}
+	if probe.Power == nil {
+		return fmt.Errorf("switch payload missing required field \"power\"")
+	}
+	cmds, err := types.StateToCommands(switchentity.Type, payload)
+	if err != nil {
+		return fmt.Errorf("switch payload is not valid canonical state: %w", err)
+	}
+	for _, cmdPayload := range cmds {
+		cmd, err := switchentity.ParseCommand(types.Command{Payload: cmdPayload})
+		if err != nil {
+			return fmt.Errorf("switch payload is not valid canonical state: %w", err)
+		}
+		if err := switchentity.ValidateCommand(cmd); err != nil {
+			return fmt.Errorf("switch payload is not valid canonical state: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *Runner) saveSnapshot(deviceID, entityID, name string, labels map[string][]string) (types.EntitySnapshot, error) {
@@ -1175,6 +1256,12 @@ func (r *Runner) sendResponse(m *nats.Msg, id *json.RawMessage, result any, rpcE
 	if err := m.Respond(data); err != nil {
 		log.Printf("plugin-runner: failed to send RPC response: %v", err)
 	}
+}
+
+func strictDecode(data []byte, out any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode(out)
 }
 
 // --- Lifecycle ---
