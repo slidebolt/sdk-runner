@@ -158,6 +158,12 @@ func (r *Runner) RunContext(ctx context.Context) error {
 	}
 	defer r.nc.Close()
 
+	// Attach NATS to the registry now that we have a live connection.
+	// This wires up lifecycle-event publishing and search-subject subscriptions.
+	if err := r.reg.AttachNATS(r.nc); err != nil {
+		return fmt.Errorf("registry NATS attach failed: %w", err)
+	}
+
 	// Load persisted state from disk into the registry's in-memory cache before
 	// handing control to the plugin. Without this, LoadState() always returns
 	// empty on first call because the cache was never populated.
