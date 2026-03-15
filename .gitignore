@@ -6,3 +6,5 @@ vendor/
 
 scripts/.release_guard
 TASKS/
+
+**/.env.local
