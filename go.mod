@@ -7,7 +7,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/slidebolt/registry v0.0.2
 	github.com/slidebolt/sdk-entities v1.20.2
-	github.com/slidebolt/sdk-types v1.20.6
+	github.com/slidebolt/sdk-types v1.20.7
 )
 
 require (
