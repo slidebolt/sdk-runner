@@ -13,10 +13,10 @@ type PluginContext struct {
 	Logger *slog.Logger
 
 	// Active Services provided by the Runner
-	Registry  *regsvc.Registry  // Direct registry access: state/devices/entities/scripts/query
-	Events    EventService      // Publishes state changes
-	Commands  CommandService    // Sends actions to other devices
-	Scheduler SchedulerService  // Periodic job scheduling
+	Registry  *regsvc.Registry // Direct registry access: state/devices/entities/scripts/query
+	Events    EventService     // Publishes state changes
+	Commands  CommandService   // Sends actions to other devices
+	Scheduler SchedulerService // Periodic job scheduling
 }
 
 // EventService emits device state changes asynchronously.

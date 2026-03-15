@@ -19,7 +19,7 @@ func (m *mockPlugin) Stop() error {
 	m.stopCalled = true
 	return nil
 }
-func (m *mockPlugin) OnReset() error                                  { return nil }
+func (m *mockPlugin) OnReset() error                                      { return nil }
 func (m *mockPlugin) OnCommand(cmd types.Command, ent types.Entity) error { return nil }
 
 func TestRunner_MockSetup(t *testing.T) {
